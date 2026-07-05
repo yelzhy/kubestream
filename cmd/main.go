@@ -20,6 +20,8 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strconv"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -50,6 +52,46 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// getEnvOrDefault returns the value of the named environment variable, or
+// def if it is unset. Used to let flags fall back to env vars (e.g. for
+// ConfigMap/Secret-projected settings) while keeping flag overrides working.
+func getEnvOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// getEnvDurationOrDefault is getEnvOrDefault for time.Duration flags. An
+// unparsable value falls back to def rather than failing startup.
+func getEnvDurationOrDefault(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		setupLog.Error(err, "Invalid duration in environment variable, using default", "env", key, "value", v, "default", def)
+		return def
+	}
+	return d
+}
+
+// getEnvIntOrDefault is getEnvOrDefault for int flags. An unparsable value
+// falls back to def rather than failing startup.
+func getEnvIntOrDefault(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		setupLog.Error(err, "Invalid integer in environment variable, using default", "env", key, "value", v, "default", def)
+		return def
+	}
+	return n
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -60,6 +102,27 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var chAddr, chDatabase, chUsername string
+	var chDialTimeout, chReadTimeout time.Duration
+	flag.StringVar(&chAddr, "ch-addr", getEnvOrDefault("CH_ADDR", "127.0.0.1:9000"),
+		"The ClickHouse server address (host:port). Can also be set via the CH_ADDR env var.")
+	flag.StringVar(&chDatabase, "ch-database", getEnvOrDefault("CH_DATABASE", "kubestream"),
+		"The ClickHouse database name. Can also be set via the CH_DATABASE env var.")
+	flag.StringVar(&chUsername, "ch-username", getEnvOrDefault("CH_USERNAME", "default"),
+		"The ClickHouse username. Can also be set via the CH_USERNAME env var.")
+	flag.DurationVar(&chDialTimeout, "ch-dial-timeout", getEnvDurationOrDefault("CH_DIAL_TIMEOUT", 5*time.Second),
+		"Timeout for establishing the ClickHouse connection. Can also be set via the CH_DIAL_TIMEOUT env var.")
+	flag.DurationVar(&chReadTimeout, "ch-read-timeout", getEnvDurationOrDefault("CH_READ_TIMEOUT", 10*time.Second),
+		"Timeout for a single ClickHouse query/insert round-trip. Can also be set via the CH_READ_TIMEOUT env var.")
+	// CH_PASSWORD is intentionally env-only (no flag): flag values are
+	// visible in `ps`/process listings, which a Secret-projected env var
+	// avoids.
+	var clusterID string
+	var maxConcurrentReconciles int
+	flag.StringVar(&clusterID, "cluster-id", getEnvOrDefault("CLUSTER_ID", "local-kind-cluster"),
+		"Identifier for this cluster, recorded on every row written to ClickHouse. Can also be set via the CLUSTER_ID env var.")
+	flag.IntVar(&maxConcurrentReconciles, "reconciler-max-concurrent", getEnvIntOrDefault("RECONCILER_MAX_CONCURRENT", 5),
+		"Maximum concurrent Reconciles per watched resource type. Can also be set via the RECONCILER_MAX_CONCURRENT env var.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -176,10 +239,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	chConfig := controller.ClickHouseConfig{
+		Addr:        chAddr,
+		Database:    chDatabase,
+		Username:    chUsername,
+		Password:    os.Getenv("CH_PASSWORD"),
+		DialTimeout: chDialTimeout,
+		ReadTimeout: chReadTimeout,
+	}
+	if chConfig.Password == "" {
+		setupLog.Info("CH_PASSWORD is not set; connecting to ClickHouse without a password")
+	}
+
+	reconcilerConfig := controller.ReconcilerConfig{
+		ClusterID:               clusterID,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
+	}
+
 	if err := (&controller.ResourceStreamReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(mgr, chConfig, reconcilerConfig); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcestream")
 		os.Exit(1)
 	}

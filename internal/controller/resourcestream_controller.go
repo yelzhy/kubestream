@@ -21,7 +21,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,20 +32,69 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/cenkalti/backoff/v4"
+	"github.com/go-logr/logr"
 	"github.com/wI2L/jsondiff"
 )
+
+// errAsyncWriteFailed is logged when a CHWriter job exhausts its retries.
+// The actual driver error is already logged inside CHWriter.process; this
+// sentinel just gives Reconcile's log.Error calls a non-nil error value.
+var errAsyncWriteFailed = errors.New("clickhouse write did not succeed after retries")
 
 type ResourceStreamReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
 	CHConn    driver.Conn
-	HashCache sync.Map
+	CHWriter  *CHWriter
+	HashCache hashCache
 	GVK       schema.GroupVersionKind
+	// ClusterID identifies this operator's cluster in every ClickHouse row
+	// it writes; it comes from ReconcilerConfig via SetupWithManager.
+	ClusterID string
+	// SafeMode is true until this GVK's HashCache has been successfully
+	// warmed from ClickHouse history (see restoreAndWarm). While true, a
+	// cache-miss can't be trusted to mean "genuinely new" — it might just
+	// mean "not loaded yet" — so Reconcile tags such events "Snapshot"
+	// instead of "Added" to avoid a mass-duplicate-write storm if
+	// ClickHouse is slow or unavailable at startup.
+	SafeMode atomic.Bool
+	// requeueCh lets a terminally-failed async write (see requeue) trigger a
+	// fresh Reconcile for the object it belongs to, instead of the write
+	// simply vanishing until something else happens to touch that object.
+	// Wired into the controller via WatchesRawSource(source.Channel(...)) in
+	// SetupWithManager.
+	requeueCh chan event.GenericEvent
+}
+
+// requeue asks controller-runtime to re-Reconcile namespace/name for this
+// GVK. Used when an async write is abandoned after exhausting CHWriter's
+// retries, so the object gets a fresh attempt instead of waiting on an
+// unrelated future change or the informer's periodic resync to notice the
+// cache was reverted. Non-blocking: if the channel is unexpectedly full, the
+// trigger is dropped and loudly logged rather than blocking a CHWriter
+// worker — the revert this follows has already made the cache consistent,
+// so a dropped trigger only delays the retry, it doesn't lose data.
+func (r *ResourceStreamReconciler) requeue(namespace, name string) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(r.GVK)
+	obj.SetNamespace(namespace)
+	obj.SetName(name)
+
+	select {
+	case r.requeueCh <- event.GenericEvent{Object: obj}:
+	default:
+		logf.Log.WithName("chwriter").Info("requeue channel full, dropping re-reconcile trigger", "kind", r.GVK.Kind, "namespace", namespace, "name", name)
+	}
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -62,19 +113,47 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// --- БЛОК ОБРАБОТКИ УДАЛЕНИЯ (IsNotFound) ---
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			if cachedVal, exists := r.HashCache.Load(objectKey); exists {
-				cachedEntry := cachedVal.(CacheEntry)
-				log.Info("🗑️ Объект удален, записываем событие в БД", "kind", r.GVK.Kind, "name", req.Name, "uid", cachedEntry.UID)
-				r.HashCache.Delete(objectKey)
+			if cachedEntry, exists := r.HashCache.Load(objectKey); exists {
+				log.Info("🗑️ Object deleted, queuing event for ClickHouse write", "kind", r.GVK.Kind, "name", req.Name, "uid", cachedEntry.UID)
 
-				emptyLabels := make(map[string]string)
-				_ = r.CHConn.Exec(ctx, `
-                    INSERT INTO resource_states (
-                        ts, cluster_id, event_type, api_group, api_version, kind, namespace, name, uid, resource_version, labels, data, diff_data, sha256
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					time.Now().UTC().Format("2006-01-02 15:04:05.999999999"), "local-kind-cluster", "Deleted", r.GVK.Group, r.GVK.Version, r.GVK.Kind,
-					req.Namespace, req.Name, cachedEntry.UID, "", emptyLabels, `{"status": "deleted"}`, "", "DELETED",
-				)
+				record := ResourceRecord{
+					Timestamp:  time.Now().UTC(),
+					ClusterID:  r.ClusterID,
+					EventType:  "Deleted",
+					APIGroup:   r.GVK.Group,
+					APIVersion: r.GVK.Version,
+					Kind:       r.GVK.Kind,
+					Namespace:  req.Namespace,
+					Name:       req.Name,
+					UID:        cachedEntry.UID,
+					Data:       `{"status": "deleted"}`,
+					SHA256:     "DELETED",
+				}
+				expectedVersion := cachedEntry.Version
+
+				// The cache entry is only removed once the deletion record is
+				// durably written (see commit) — never before — so a crash or
+				// write failure can't silently drop this object from history.
+				// The version check guards against a rarer case: the object
+				// being deleted and quickly recreated (new UID) while this job
+				// is still in flight — DeleteIfCurrent then correctly leaves
+				// the newer incarnation's cache entry alone instead of wiping
+				// it out from under it.
+				enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
+					query: insertResourceStateQuery,
+					args:  record.insertArgs(),
+					commit: func(ok bool) {
+						if ok {
+							r.HashCache.DeleteIfCurrent(objectKey, expectedVersion)
+							return
+						}
+						log.Error(errAsyncWriteFailed, "🗑️ Deletion write failed, cache left untouched so it is retried", "kind", r.GVK.Kind, "name", req.Name)
+					},
+				})
+				if enqueueErr != nil {
+					log.Error(enqueueErr, "🗑️ Failed to queue deletion event, requeuing", "kind", r.GVK.Kind, "name", req.Name)
+					return ctrl.Result{}, enqueueErr
+				}
 			}
 			return ctrl.Result{}, nil
 		}
@@ -106,25 +185,50 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	var diffString = ""
 	var dataString = string(objJson)
 
-	// --- БЛОК ДЕДУПЛИКАЦИИ И РЕИНКАРНАЦИИ ---
-	if cachedVal, exists := r.HashCache.Load(objectKey); exists {
-		cachedEntry := cachedVal.(CacheEntry)
+	// revertEntry is what the cache should fall back to if the write below
+	// ultimately fails, so a lost write can never be mistaken for a
+	// confirmed one on a subsequent Reconcile. nil means "no prior confirmed
+	// state" (delete the key entirely on failure).
+	var revertEntry *CacheEntry
 
+	// --- БЛОК ДЕДУПЛИКАЦИИ И РЕИНКАРНАЦИИ ---
+	if cachedEntry, exists := r.HashCache.Load(objectKey); exists {
 		// 🚨 МАГИЯ ПРОТИВ ЗОМБИ: Проверяем UID!
 		if cachedEntry.UID != "" && cachedEntry.UID != currentUID {
-			log.Info("🧟 Реинкарнация! Старый объект умер во время даунтайма. Пишем Deleted для старого и Added для нового", "name", req.Name)
+			log.Info("🧟 Reincarnation! Old object died during downtime — closing its history and treating the current one as Added", "name", req.Name)
 
-			// 1. Закрываем историю старого объекта
-			emptyLabels := make(map[string]string)
-			_ = r.CHConn.Exec(ctx, `
-                INSERT INTO resource_states (
-                    ts, cluster_id, event_type, api_group, api_version, kind, namespace, name, uid, resource_version, labels, data, diff_data, sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				time.Now().UTC().Format("2006-01-02 15:04:05.999999999"), "local-kind-cluster", "Deleted", r.GVK.Group, r.GVK.Version, r.GVK.Kind,
-				req.Namespace, req.Name, cachedEntry.UID, "", emptyLabels, `{"status": "deleted"}`, "", "DELETED",
-			)
+			closeRecord := ResourceRecord{
+				Timestamp:  time.Now().UTC(),
+				ClusterID:  r.ClusterID,
+				EventType:  "Deleted",
+				APIGroup:   r.GVK.Group,
+				APIVersion: r.GVK.Version,
+				Kind:       r.GVK.Kind,
+				Namespace:  req.Namespace,
+				Name:       req.Name,
+				UID:        cachedEntry.UID,
+				Data:       `{"status": "deleted"}`,
+				SHA256:     "DELETED",
+			}
+			oldUID := cachedEntry.UID
 
-			// 2. Текущий объект обрабатывается как чистый Added (оставляем eventType = "Added")
+			// 1. Закрываем историю старого объекта (async, best-effort logged on failure)
+			enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
+				query: insertResourceStateQuery,
+				args:  closeRecord.insertArgs(),
+				commit: func(ok bool) {
+					if !ok {
+						log.Error(errAsyncWriteFailed, "🧟 Failed to close out reincarnated object's history", "kind", r.GVK.Kind, "name", req.Name, "old_uid", oldUID)
+					}
+				},
+			})
+			if enqueueErr != nil {
+				log.Error(enqueueErr, "🧟 Failed to queue reincarnation close-out event, requeuing", "kind", r.GVK.Kind, "name", req.Name)
+				return ctrl.Result{}, enqueueErr
+			}
+
+			// 2. Текущий объект обрабатывается как чистый Added (оставляем eventType = "Added").
+			// There is no confirmed prior state for THIS UID, so revertEntry stays nil.
 		} else {
 			// Обычная логика (объект тот же самый)
 			if cachedEntry.Hash == hashString {
@@ -133,7 +237,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 			eventType = "Modified"
 			if cachedEntry.JSON == nil {
-				log.Info("🔄 Відновлено після рестарту (Full State)", "kind", r.GVK.Kind, "name", req.Name)
+				log.Info("🔄 Restored after restart (Full State)", "kind", r.GVK.Kind, "name", req.Name)
 				dataString = string(objJson)
 				diffString = ""
 			} else {
@@ -141,52 +245,136 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				patchBytes, _ := json.Marshal(patch)
 				diffString = string(patchBytes)
 				dataString = ""
-				log.Info("📝 Обнаружено изменение (Diff)", "kind", r.GVK.Kind, "name", req.Name)
+				log.Info("📝 Change detected (Diff)", "kind", r.GVK.Kind, "name", req.Name)
 			}
+			entryCopy := cachedEntry
+			revertEntry = &entryCopy
 		}
 	} else {
-		log.Info("🌟 Новый объект (Added)", "kind", r.GVK.Kind, "name", req.Name)
+		log.Info("🌟 New object observed", "kind", r.GVK.Kind, "name", req.Name)
 	}
 
-	// Сохраняем в кэш
-	r.HashCache.Store(objectKey, CacheEntry{
+	// A cache-miss (eventType still "Added") during SafeMode can't be
+	// trusted to mean "genuinely new" — the cache may simply not be warmed
+	// yet. Tag it Snapshot so a slow/unavailable ClickHouse at startup
+	// never masquerades as a mass "Added" duplicate-write storm.
+	if eventType == "Added" && r.SafeMode.Load() {
+		eventType = "Snapshot"
+		log.Info("🌱 Cache not yet warmed, tagging as Snapshot", "kind", r.GVK.Kind, "name", req.Name)
+	}
+
+	// Reserve atomically assigns the next version for this key and stores
+	// the pending entry, so a duplicate Reconcile firing before the write is
+	// confirmed short-circuits as a no-op instead of enqueuing a second
+	// write for identical content. The returned version is threaded into
+	// the job below: the eventual commit (running in a CHWriter worker,
+	// possibly out of order relative to some other job for this same key)
+	// only applies its result via CommitIfCurrent/revertVersion if this is
+	// still the latest write issued for the key — otherwise a newer write
+	// has already superseded it and is left alone.
+	version := r.HashCache.Reserve(objectKey, CacheEntry{
 		Hash: hashString,
 		JSON: objJson,
 		UID:  currentUID,
 	})
 
-	// --- БЛОК ЭКСПОРТА ---
-	err = r.CHConn.Exec(ctx, `
-        INSERT INTO resource_states (
-            ts, cluster_id, event_type, api_group, api_version, kind, namespace, name, uid, resource_version, labels, data, diff_data, sha256
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now().UTC().Format("2006-01-02 15:04:05.999999999"), "local-kind-cluster", eventType, r.GVK.Group, r.GVK.Version,
-		r.GVK.Kind, req.Namespace, req.Name, currentUID, originalRV,
-		labels, dataString, diffString, hashString,
-	)
+	revertVersion := func() {
+		if revertEntry != nil {
+			r.HashCache.CommitIfCurrent(objectKey, version, *revertEntry)
+		} else {
+			r.HashCache.DeleteIfCurrent(objectKey, version)
+		}
+	}
 
-	if err != nil {
-		log.Error(err, "Ошибка при записи в ClickHouse")
-		return ctrl.Result{}, err
+	record := ResourceRecord{
+		Timestamp:       time.Now().UTC(),
+		ClusterID:       r.ClusterID,
+		EventType:       eventType,
+		APIGroup:        r.GVK.Group,
+		APIVersion:      r.GVK.Version,
+		Kind:            r.GVK.Kind,
+		Namespace:       req.Namespace,
+		Name:            req.Name,
+		UID:             currentUID,
+		ResourceVersion: originalRV,
+		Labels:          labels,
+		Data:            dataString,
+		DiffData:        diffString,
+		SHA256:          hashString,
+	}
+
+	// --- БЛОК ЭКСПОРТА ---
+	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
+		query: insertResourceStateQuery,
+		args:  record.insertArgs(),
+		commit: func(ok bool) {
+			if ok {
+				// Only now is the write durably confirmed — settle the
+				// pending marker into a confirmed cache entry, unless a
+				// newer write has already superseded this one.
+				r.HashCache.CommitIfCurrent(objectKey, version, CacheEntry{
+					Hash: hashString,
+					JSON: objJson,
+					UID:  currentUID,
+				})
+				return
+			}
+			log.Error(errAsyncWriteFailed, "Write failed after retries, reverting cache and requesting a fresh Reconcile", "kind", r.GVK.Kind, "name", req.Name)
+			revertVersion()
+			// Unlike a synchronous write failure, returning an error here
+			// wouldn't reach controller-runtime — this callback runs well
+			// after Reconcile already returned. Trigger a fresh Reconcile
+			// explicitly so the write is retried instead of only self-healing
+			// on the next unrelated change or informer resync.
+			r.requeue(req.Namespace, req.Name)
+		},
+	})
+	if enqueueErr != nil {
+		// The job never entered the write pipeline, so no commit will ever
+		// fire for it — undo the optimistic marker ourselves.
+		revertVersion()
+		log.Error(enqueueErr, "Failed to queue write, requeuing", "kind", r.GVK.Kind, "name", req.Name)
+		return ctrl.Result{}, enqueueErr
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig ClickHouseConfig, reconcilerConfig ReconcilerConfig) error {
 	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{"127.0.0.1:9000"},
+		Addr: []string{chConfig.Addr},
 		Auth: clickhouse.Auth{
-			Database: "kubestream",
-			Username: "default",
-			Password: "kpi123",
+			Database: chConfig.Database,
+			Username: chConfig.Username,
+			Password: chConfig.Password,
 		},
-		Protocol: clickhouse.Native,
+		Protocol:    clickhouse.Native,
+		DialTimeout: chConfig.DialTimeout,
+		ReadTimeout: chConfig.ReadTimeout,
 	})
 	if err != nil {
 		return err
 	}
 	r.CHConn = conn
+
+	// CHWriter decouples every ClickHouse insert from the Reconcile hot path
+	// (see chwriter.go). One instance is shared across all watched GVKs; its
+	// lifecycle — including closing conn on shutdown — is tied to the
+	// manager's via mgr.Add. insertTimeout is chConfig.ReadTimeout, so the
+	// operator-configured value actually governs the async write path (not
+	// just the connection's own driver-level timeout).
+	chWriter := NewCHWriter(conn, 0, 0, chConfig.ReadTimeout, 0)
+
+	// connUsers tracks goroutines besides CHWriter's own workers that still
+	// need conn (namely restoreAndWarm, below) — CHWriter waits for this to
+	// drain before closing conn, so shutdown can never race a use of the
+	// shared connection against its closure.
+	var connUsers sync.WaitGroup
+	chWriter.WaitForOthers(&connUsers)
+
+	if err := mgr.Add(chWriter); err != nil {
+		return err
+	}
 
 	gvksToWatch := []schema.GroupVersionKind{
 		{Group: "", Version: "v1", Kind: "Pod"},
@@ -197,128 +385,221 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	log := logf.Log.WithName("setup")
 
 	for _, gvk := range gvksToWatch {
+		// requeueCh lets a terminally-failed write for this GVK trigger a
+		// fresh Reconcile (see ResourceStreamReconciler.requeue) without
+		// going through the normal informer watch.
+		requeueCh := make(chan event.GenericEvent, 100)
+
 		reconciler := &ResourceStreamReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
-			CHConn: conn,
-			GVK:    gvk,
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			CHConn:    conn,
+			CHWriter:  chWriter,
+			GVK:       gvk,
+			ClusterID: reconcilerConfig.ClusterID,
+			requeueCh: requeueCh,
+		}
+		// The cache starts empty and isn't trustworthy until restoreAndWarm
+		// (below) finishes — see the SafeMode field doc and Reconcile.
+		reconciler.SafeMode.Store(true)
+
+		connUsers.Add(1)
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			defer connUsers.Done()
+			return restoreAndWarm(ctx, mgr, conn, reconciler, gvk, log)
+		})); err != nil {
+			return err
 		}
 
-		log.Info("🔄 Відновлення пам'яті з ClickHouse...", "kind", gvk.Kind)
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
 
-		// Витягуємо UID з бази!
-		rows, err := conn.Query(context.Background(), `
+		if err := ctrl.NewControllerManagedBy(mgr).
+			For(obj).
+			WatchesRawSource(source.Channel(requeueCh, &handler.EnqueueRequestForObject{})).
+			Named("stream-" + gvk.Kind).
+			WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: reconcilerConfig.MaxConcurrentReconciles}).
+			Complete(reconciler); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// restoreAndWarm rebuilds a single GVK's HashCache from ClickHouse history in
+// the background, then runs the zombie-object GC pass. Running this as a
+// manager.Runnable (rather than inline in SetupWithManager) means mgr.Start()
+// is never gated on ClickHouse being reachable at boot.
+//
+// The restore query is retried indefinitely (bounded backoff, no elapsed-time
+// cutoff) until it succeeds or ctx is cancelled by manager shutdown. While it
+// hasn't yet succeeded, reconciler.SafeMode stays true, so Reconcile tags
+// cache-miss events "Snapshot" instead of "Added" — a ClickHouse outage at
+// startup degrades to that instead of re-emitting every live object in the
+// cluster as a duplicate "Added" row.
+func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, reconciler *ResourceStreamReconciler, gvk schema.GroupVersionKind, log logr.Logger) error {
+	log.Info("🔄 Warming cache from ClickHouse history...", "kind", gvk.Kind)
+
+	type gcTarget struct {
+		Namespace string
+		Name      string
+		UID       string
+	}
+	var targetsToCheck []gcTarget
+
+	warm := func() error {
+		targetsToCheck = nil
+
+		rows, err := conn.Query(ctx, `
             SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts)
             FROM resource_states
             WHERE kind = ?
             GROUP BY namespace, name
             HAVING argMax(event_type, ts) != 'Deleted'
         `, gvk.Kind)
-
-		// Структура для GC
-		type gcTarget struct {
-			Namespace string
-			Name      string
-			UID       string
-		}
-		var targetsToCheck []gcTarget
-
-		if err == nil {
-			restoredCount := 0
-			for rows.Next() {
-				var namespace, name, uid, hash string
-				if err := rows.Scan(&namespace, &name, &uid, &hash); err == nil {
-					key := gvk.Kind + "/"
-					if namespace != "" {
-						key += namespace + "/" + name
-					} else {
-						key += name
-					}
-
-					reconciler.HashCache.Store(key, CacheEntry{
-						Hash: hash,
-						JSON: nil,
-						UID:  uid,
-					})
-					restoredCount++
-					targetsToCheck = append(targetsToCheck, gcTarget{Namespace: namespace, Name: name, UID: uid})
-				}
-			}
-			rows.Close()
-			log.Info("✅ Кеш відновлено", "kind", gvk.Kind, "objects_loaded", restoredCount)
-
-			// ==========================================
-			// 🕵️‍♂️ Garbage Collector (з перевіркою UID)
-			// ==========================================
-			if len(targetsToCheck) > 0 {
-				gcGVK := gvk
-				gcReconciler := reconciler
-
-				mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-					if !mgr.GetCache().WaitForCacheSync(ctx) {
-						return nil
-					}
-
-					zombieCount := 0
-					for _, target := range targetsToCheck {
-						obj := &unstructured.Unstructured{}
-						obj.SetGroupVersionKind(gcGVK)
-						reqKey := client.ObjectKey{Namespace: target.Namespace, Name: target.Name}
-
-						err := mgr.GetClient().Get(ctx, reqKey, obj)
-
-						// Зомбі виявлено, якщо об'єкта немає АБО якщо його UID змінився
-						isZombie := false
-						if err != nil && apierrors.IsNotFound(err) {
-							isZombie = true
-						} else if err == nil && string(obj.GetUID()) != target.UID {
-							isZombie = true
-						}
-
-						if isZombie {
-							cacheKey := gcGVK.Kind + "/"
-							if reqKey.Namespace != "" {
-								cacheKey += reqKey.Namespace + "/" + reqKey.Name
-							} else {
-								cacheKey += reqKey.Name
-							}
-
-							gcReconciler.HashCache.Delete(cacheKey)
-							emptyLabels := make(map[string]string)
-							_ = conn.Exec(ctx, `
-                                INSERT INTO resource_states (
-                                    ts, cluster_id, event_type, api_group, api_version, kind, namespace, name, uid, resource_version, labels, data, diff_data, sha256
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-								time.Now().UTC().Format("2006-01-02 15:04:05.999999999"), "local-kind-cluster", "Deleted", gcGVK.Group, gcGVK.Version, gcGVK.Kind,
-								reqKey.Namespace, reqKey.Name, target.UID, "", emptyLabels, `{"status": "deleted"}`, "", "DELETED",
-							)
-							zombieCount++
-							log.Info("🧟 Зомбі-об'єкт виявлено та видалено GC", "kind", gcGVK.Kind, "name", reqKey.Name)
-						}
-					}
-					if zombieCount > 0 {
-						log.Info("🧹 Garbage Collector завершив роботу", "kind", gcGVK.Kind, "zombies_cleared", zombieCount)
-					}
-					return nil
-				}))
-			}
-			// ==========================================
-
-		} else {
-			log.Error(err, "Помилка відновлення кешу (можливо таблиця порожня)")
-		}
-
-		obj := &unstructured.Unstructured{}
-		obj.SetGroupVersionKind(gvk)
-
-		err = ctrl.NewControllerManagedBy(mgr).
-			For(obj).
-			Named("stream-" + gvk.Kind).
-			Complete(reconciler)
 		if err != nil {
 			return err
 		}
+		defer rows.Close()
+
+		restoredCount := 0
+		for rows.Next() {
+			var namespace, name, uid, hash string
+			if err := rows.Scan(&namespace, &name, &uid, &hash); err != nil {
+				continue
+			}
+			key := gvk.Kind + "/"
+			if namespace != "" {
+				key += namespace + "/" + name
+			} else {
+				key += name
+			}
+
+			// StoreIfAbsent, not Store: a live Reconcile may already have
+			// reserved a newer entry for this key while SafeMode was still
+			// true (tagged "Snapshot") — that live state is authoritative
+			// and must not be clobbered by this historical baseline.
+			reconciler.HashCache.StoreIfAbsent(key, CacheEntry{
+				Hash: hash,
+				JSON: nil,
+				UID:  uid,
+			})
+			restoredCount++
+			targetsToCheck = append(targetsToCheck, gcTarget{Namespace: namespace, Name: name, UID: uid})
+		}
+		log.Info("✅ Cache warmed", "kind", gvk.Kind, "objects_loaded", restoredCount)
+		return nil
 	}
 
+	eb := backoff.NewExponentialBackOff()
+	eb.MaxInterval = 30 * time.Second
+	eb.MaxElapsedTime = 0 // retry forever — only ctx cancellation (shutdown) gives up
+
+	err := backoff.Retry(func() error {
+		if err := warm(); err != nil {
+			log.Error(err, "⚠️ Failed to warm cache from ClickHouse, staying in Snapshot mode and retrying", "kind", gvk.Kind)
+			return err
+		}
+		return nil
+	}, backoff.WithContext(eb, ctx))
+	if err != nil {
+		// Only reachable if ctx was cancelled (manager shutting down) before
+		// the restore ever succeeded — SafeMode simply stays on; there is no
+		// GC to run since we never got a trustworthy targetsToCheck.
+		return nil
+	}
+
+	reconciler.SafeMode.Store(false)
+	log.Info("🔓 Cache warm-up complete, leaving Snapshot mode", "kind", gvk.Kind)
+
+	if len(targetsToCheck) == 0 {
+		return nil
+	}
+
+	// ==========================================
+	// 🕵️‍♂️ Garbage Collector (з перевіркою UID)
+	// ==========================================
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		return nil
+	}
+
+	zombieCount := 0
+	for _, target := range targetsToCheck {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		reqKey := client.ObjectKey{Namespace: target.Namespace, Name: target.Name}
+
+		getErr := mgr.GetClient().Get(ctx, reqKey, obj)
+
+		// Зомбі виявлено, якщо об'єкта немає АБО якщо його UID змінився
+		isZombie := false
+		if getErr != nil && apierrors.IsNotFound(getErr) {
+			isZombie = true
+		} else if getErr == nil && string(obj.GetUID()) != target.UID {
+			isZombie = true
+		}
+
+		if !isZombie {
+			continue
+		}
+
+		cacheKey := gvk.Kind + "/"
+		if reqKey.Namespace != "" {
+			cacheKey += reqKey.Namespace + "/" + reqKey.Name
+		} else {
+			cacheKey += reqKey.Name
+		}
+
+		cachedEntry, exists := reconciler.HashCache.Load(cacheKey)
+		if !exists {
+			// A live delete Reconcile already handled this object (and
+			// already wrote its own Deleted row) in the time between
+			// building targetsToCheck and getting here — nothing to do.
+			continue
+		}
+		expectedVersion := cachedEntry.Version
+
+		record := ResourceRecord{
+			Timestamp:  time.Now().UTC(),
+			ClusterID:  reconciler.ClusterID,
+			EventType:  "Deleted",
+			APIGroup:   gvk.Group,
+			APIVersion: gvk.Version,
+			Kind:       gvk.Kind,
+			Namespace:  reqKey.Namespace,
+			Name:       reqKey.Name,
+			UID:        target.UID,
+			Data:       `{"status": "deleted"}`,
+			SHA256:     "DELETED",
+		}
+
+		// Routed through CHWriter like every other write, instead of a raw
+		// conn.Exec: retried on failure, and the cache entry is only
+		// removed once the write is durably confirmed (guarded by the same
+		// version check as the live delete path, in case a live Reconcile
+		// raced ahead of this GC pass for the same key).
+		enqueueErr := reconciler.CHWriter.Enqueue(ctx, 0, writeJob{
+			query: insertResourceStateQuery,
+			args:  record.insertArgs(),
+			commit: func(ok bool) {
+				if ok {
+					reconciler.HashCache.DeleteIfCurrent(cacheKey, expectedVersion)
+					return
+				}
+				log.Error(errAsyncWriteFailed, "🧟 Zombie cleanup write failed, cache left untouched so it is retried", "kind", gvk.Kind, "name", reqKey.Name)
+			},
+		})
+		if enqueueErr != nil {
+			log.Error(enqueueErr, "🧟 Failed to queue zombie cleanup event", "kind", gvk.Kind, "name", reqKey.Name)
+			continue
+		}
+
+		zombieCount++
+		log.Info("🧟 Zombie object detected and cleaned up by GC", "kind", gvk.Kind, "name", reqKey.Name)
+	}
+	if zombieCount > 0 {
+		log.Info("🧹 Garbage collector finished", "kind", gvk.Kind, "zombies_cleared", zombieCount)
+	}
 	return nil
 }

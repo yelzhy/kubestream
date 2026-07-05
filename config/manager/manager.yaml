@@ -65,6 +65,26 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        # TODO(user): CH_ADDR/CH_DATABASE/CH_USERNAME/CLUSTER_ID below are
+        # local/dev placeholders (matching a ClickHouse reachable from this
+        # pod, e.g. via a sidecar or port-forward). Point them at your real
+        # ClickHouse service and cluster identifier before deploying.
+        env:
+        - name: CH_ADDR
+          value: "127.0.0.1:9000"
+        - name: CH_DATABASE
+          value: "kubestream"
+        - name: CH_USERNAME
+          value: "default"
+        - name: CH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: clickhouse-credentials
+              key: password
+        - name: CLUSTER_ID
+          value: "local-kind-cluster"
+        - name: RECONCILER_MAX_CONCURRENT
+          value: "5"
         ports:
         - containerPort: 8081
           name: health
