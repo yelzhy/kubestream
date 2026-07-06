@@ -392,14 +392,31 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				return ctrl.Result{}, nil // Duplicate
 			}
 
+			// switchToFullState is the shared fallback for every case where a
+			// diff can't be produced (no prior JSON to diff against, or the
+			// diff/marshal itself fails) — writing the full current state is
+			// always correct on its own, just larger than a diff would be.
+			switchToFullState := func() {
+				dataString = string(objJson)
+				diffString = ""
+			}
+
 			eventType = "Modified"
 			if cachedEntry.JSON == nil {
 				log.Info("🔄 Restored after restart (Full State)", "kind", r.GVK.Kind, "name", req.Name)
-				dataString = string(objJson)
-				diffString = ""
+				switchToFullState()
+			} else if patch, err := jsondiff.CompareJSON(cachedEntry.JSON, objJson); err != nil {
+				// Not expected to be reachable today — cachedEntry.JSON and
+				// objJson are always the product of a prior successful
+				// json.Marshal — but a silently-discarded error here would
+				// otherwise write neither a diff nor the full state,
+				// corrupting this row's audit value with no log signal.
+				log.Error(err, "⚠️ Failed to compute JSON diff, falling back to full state", "kind", r.GVK.Kind, "name", req.Name)
+				switchToFullState()
+			} else if patchBytes, err := json.Marshal(patch); err != nil {
+				log.Error(err, "⚠️ Failed to marshal JSON diff, falling back to full state", "kind", r.GVK.Kind, "name", req.Name)
+				switchToFullState()
 			} else {
-				patch, _ := jsondiff.CompareJSON(cachedEntry.JSON, objJson)
-				patchBytes, _ := json.Marshal(patch)
 				diffString = string(patchBytes)
 				dataString = ""
 				log.Info("📝 Change detected (Diff)", "kind", r.GVK.Kind, "name", req.Name)
