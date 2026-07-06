@@ -29,11 +29,12 @@ import (
 )
 
 const (
-	defaultWriteQueueSize  = 5000
-	defaultWriteWorkers    = 4
-	defaultInsertTimeout   = 5 * time.Second
-	defaultEnqueueTimeout  = 2 * time.Second
-	defaultMaxRetryBackoff = 60 * time.Second
+	defaultWriteQueueSize       = 5000
+	defaultWriteWorkers         = 4
+	defaultInsertTimeout        = 5 * time.Second
+	defaultEnqueueTimeout       = 2 * time.Second
+	defaultMaxRetryBackoff      = 60 * time.Second
+	defaultShutdownDrainTimeout = 15 * time.Second
 
 	chTimeFormat = "2006-01-02 15:04:05.999999999"
 
@@ -63,16 +64,23 @@ type CHWriter struct {
 	jobs    chan writeJob
 	workers int
 
-	insertTimeout   time.Duration
-	maxRetryBackoff time.Duration
+	insertTimeout        time.Duration
+	maxRetryBackoff      time.Duration
+	shutdownDrainTimeout time.Duration
 
-	// mu guards closing; see Enqueue/beginClosing.
+	// mu guards closing and drainCtx; see Enqueue/attemptContext.
 	mu      sync.Mutex
 	closing bool
 	// inflight tracks Enqueue calls that observed closing==false and are
 	// therefore permitted to send on jobs; Start waits for it to drain to
 	// zero before closing jobs, so a send can never race a close.
 	inflight sync.WaitGroup
+	// drainCtx is swapped from a plain context.Background() to a
+	// shutdownDrainTimeout-bounded context the moment Start detects shutdown
+	// (ctx.Done() fires) — see attemptContext. Starts non-nil so a worker
+	// that reads it before Start ever swaps it (a narrow, harmless race) still
+	// gets a safe, non-nil context rather than risking a nil-context panic.
+	drainCtx context.Context
 
 	// otherUsers, if set, is waited on after this CHWriter's own workers
 	// finish draining and before conn is closed — for goroutines outside
@@ -83,7 +91,7 @@ type CHWriter struct {
 
 // NewCHWriter builds a CHWriter around an existing ClickHouse connection.
 // Zero-valued queueSize/workers/timeouts fall back to sane defaults.
-func NewCHWriter(conn driver.Conn, queueSize, workers int, insertTimeout, maxRetryBackoff time.Duration) *CHWriter {
+func NewCHWriter(conn driver.Conn, queueSize, workers int, insertTimeout, maxRetryBackoff, shutdownDrainTimeout time.Duration) *CHWriter {
 	if queueSize <= 0 {
 		queueSize = defaultWriteQueueSize
 	}
@@ -96,12 +104,17 @@ func NewCHWriter(conn driver.Conn, queueSize, workers int, insertTimeout, maxRet
 	if maxRetryBackoff <= 0 {
 		maxRetryBackoff = defaultMaxRetryBackoff
 	}
+	if shutdownDrainTimeout <= 0 {
+		shutdownDrainTimeout = defaultShutdownDrainTimeout
+	}
 	return &CHWriter{
-		conn:            conn,
-		jobs:            make(chan writeJob, queueSize),
-		workers:         workers,
-		insertTimeout:   insertTimeout,
-		maxRetryBackoff: maxRetryBackoff,
+		conn:                 conn,
+		jobs:                 make(chan writeJob, queueSize),
+		workers:              workers,
+		insertTimeout:        insertTimeout,
+		maxRetryBackoff:      maxRetryBackoff,
+		shutdownDrainTimeout: shutdownDrainTimeout,
+		drainCtx:             context.Background(),
 	}
 }
 
@@ -151,14 +164,17 @@ func (w *CHWriter) Enqueue(ctx context.Context, enqueueTimeout time.Duration, jo
 // cancelled, then shuts down in a strict order so no write is ever stranded
 // or raced against connection closure:
 //  1. Stop accepting new Enqueue calls (under mu, so this can't race a send).
-//  2. Wait for any Enqueue call already past that check to finish sending
-//     (or bail via its own ctx/timeout) — after this, jobs can receive no
-//     further sends from anyone.
-//  3. Close jobs. Workers range over it, so they drain every already-queued
+//  2. Swap in a fresh, shutdownDrainTimeout-bounded drainCtx for any job
+//     processed from here on — see attemptContext for why the original ctx
+//     (already cancelled by this point) can't be reused for these attempts.
+//  3. Wait for any Enqueue call already past the closing check to finish
+//     sending (or bail via its own ctx/timeout) — after this, jobs can
+//     receive no further sends from anyone.
+//  4. Close jobs. Workers range over it, so they drain every already-queued
 //     job and then exit cleanly once it's both empty and closed — no worker
 //     can exit "too early" and leave a job stranded.
-//  4. Wait for otherUsers (if set) — other goroutines sharing conn.
-//  5. Close conn — guaranteed safe now, since nothing can still be using it.
+//  5. Wait for otherUsers (if set) — other goroutines sharing conn.
+//  6. Close conn — guaranteed safe now, since nothing can still be using it.
 func (w *CHWriter) Start(ctx context.Context) error {
 	log := logf.Log.WithName("chwriter")
 
@@ -168,15 +184,19 @@ func (w *CHWriter) Start(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			for job := range w.jobs {
-				w.process(ctx, log, job)
+				w.process(w.attemptContext(ctx), log, job)
 			}
 		}()
 	}
 
 	<-ctx.Done()
 
+	drainCtx, cancel := context.WithTimeout(context.Background(), w.shutdownDrainTimeout)
+	defer cancel()
+
 	w.mu.Lock()
 	w.closing = true
+	w.drainCtx = drainCtx
 	w.mu.Unlock()
 	w.inflight.Wait()
 	close(w.jobs)
@@ -192,6 +212,27 @@ func (w *CHWriter) Start(ctx context.Context) error {
 	}
 	log.Info("chwriter: ClickHouse connection closed")
 	return nil
+}
+
+// attemptContext returns ctx unchanged while it's still live, so a write that
+// is genuinely in flight when shutdown begins is still cancelled promptly
+// rather than allowed to run past the manager's own shutdown deadline. Once
+// ctx has already fired — meaning this job is being pulled from the queue
+// during Start's post-shutdown drain, not interrupted mid-attempt — deriving
+// its write's timeout from ctx would guarantee an instant, no-chance failure
+// on the very first attempt regardless of ClickHouse's actual health,
+// defeating the drain phase's whole purpose. Such jobs get drainCtx instead:
+// one context.WithTimeout(shutdownDrainTimeout) shared by every job drained
+// during shutdown, so the whole drain phase (not each job individually) is
+// what's bounded, giving queued writes a genuine chance to flush to a
+// healthy ClickHouse before the process exits.
+func (w *CHWriter) attemptContext(ctx context.Context) context.Context {
+	if ctx.Err() == nil {
+		return ctx
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.drainCtx
 }
 
 // process writes a single job to ClickHouse, retrying with exponential

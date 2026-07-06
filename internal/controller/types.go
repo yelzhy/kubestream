@@ -4,7 +4,7 @@ import (
 	"time"
 )
 
-// CacheEntry хранит данные в оперативной памяти (hashCache)
+// CacheEntry holds the in-memory cached state for one object (see hashCache).
 type CacheEntry struct {
 	Hash string
 	JSON []byte
@@ -24,7 +24,7 @@ type CacheEntry struct {
 	PendingDelete bool
 }
 
-// ResourceRecord - это универсальная структура для отправки в ClickHouse
+// ResourceRecord is the universal structure used to send a row to ClickHouse.
 type ResourceRecord struct {
 	Timestamp       time.Time         `json:"timestamp"`
 	ClusterID       string            `json:"cluster_id"`
@@ -37,8 +37,8 @@ type ResourceRecord struct {
 	UID             string            `json:"uid"`
 	ResourceVersion string            `json:"resource_version"`
 	Labels          map[string]string `json:"labels"`
-	Data            string            `json:"data"`      // Полный JSON (для Added)
-	DiffData        string            `json:"diff_data"` // Дельта изменений (для Modified)
+	Data            string            `json:"data"`      // Full JSON (for Added)
+	DiffData        string            `json:"diff_data"` // Change delta (for Modified)
 	SHA256          string            `json:"sha256"`
 }
 

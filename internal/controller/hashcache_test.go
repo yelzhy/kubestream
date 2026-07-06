@@ -119,7 +119,7 @@ func TestHashCacheReserveDeleteClaimsOnce(t *testing.T) {
 	var c hashCache
 	c.Reserve("k", CacheEntry{UID: "uid-1"})
 
-	entry, version, claimed := c.ReserveDelete("k")
+	entry, version, claimed := c.ReserveDelete("k", "")
 	if !claimed {
 		t.Fatalf("expected the first ReserveDelete to claim the key")
 	}
@@ -127,7 +127,7 @@ func TestHashCacheReserveDeleteClaimsOnce(t *testing.T) {
 		t.Fatalf("expected the claimed entry to carry the pre-claim UID, got %+v", entry)
 	}
 
-	if _, _, claimedAgain := c.ReserveDelete("k"); claimedAgain {
+	if _, _, claimedAgain := c.ReserveDelete("k", ""); claimedAgain {
 		t.Fatalf("a second ReserveDelete must not claim a key that's already pending delete")
 	}
 
@@ -143,7 +143,7 @@ func TestHashCacheReserveDeleteClaimsOnce(t *testing.T) {
 // key was never known (or was already removed), so there's nothing to claim.
 func TestHashCacheReserveDeleteNothingToDelete(t *testing.T) {
 	var c hashCache
-	if _, _, claimed := c.ReserveDelete("missing"); claimed {
+	if _, _, claimed := c.ReserveDelete("missing", ""); claimed {
 		t.Fatalf("ReserveDelete must not claim a key with no entry")
 	}
 }
@@ -154,7 +154,7 @@ func TestHashCacheUnclaimDeleteAllowsRetry(t *testing.T) {
 	var c hashCache
 	c.Reserve("k", CacheEntry{UID: "uid-1"})
 
-	_, version, claimed := c.ReserveDelete("k")
+	_, version, claimed := c.ReserveDelete("k", "")
 	if !claimed {
 		t.Fatalf("expected the claim to succeed")
 	}
@@ -166,8 +166,37 @@ func TestHashCacheUnclaimDeleteAllowsRetry(t *testing.T) {
 		t.Fatalf("expected the claim to be released and the entry to remain, got %+v (exists=%v)", entry, exists)
 	}
 
-	if _, _, claimedAgain := c.ReserveDelete("k"); !claimedAgain {
+	if _, _, claimedAgain := c.ReserveDelete("k", ""); !claimedAgain {
 		t.Fatalf("expected a fresh ReserveDelete to succeed once the prior claim was released")
+	}
+}
+
+// TestHashCacheReserveDeleteRefusesUIDMismatch reproduces the confirmed
+// GC-vs-reincarnation finding: the startup GC pass believes an object with a
+// stale, point-in-time-snapshotted UID is gone, but a live Reconcile has
+// since reincarnated it (deleted and recreated under a new UID) and already
+// updated the cache via Reserve. Without the expectedUID check, ReserveDelete
+// would claim and let the caller delete this live, correct entry by name
+// alone. With it, a mismatched expectedUID must refuse the claim.
+func TestHashCacheReserveDeleteRefusesUIDMismatch(t *testing.T) {
+	var c hashCache
+	c.Reserve("k", CacheEntry{UID: "old-uid"})
+
+	// A live reincarnation happens before the GC pass gets to this key.
+	c.Reserve("k", CacheEntry{UID: "new-uid"})
+
+	if _, _, claimed := c.ReserveDelete("k", "old-uid"); claimed {
+		t.Fatalf("ReserveDelete must refuse a claim when expectedUID no longer matches the live entry")
+	}
+
+	entry, exists := c.Load("k")
+	if !exists || entry.UID != "new-uid" || entry.PendingDelete {
+		t.Fatalf("the live entry must be untouched after a refused UID-mismatched claim, got %+v (exists=%v)", entry, exists)
+	}
+
+	// The GC pass's own UID does still match when no reincarnation occurred.
+	if _, _, claimed := c.ReserveDelete("k", "new-uid"); !claimed {
+		t.Fatalf("ReserveDelete should claim when expectedUID matches the current entry")
 	}
 }
 
@@ -178,7 +207,7 @@ func TestHashCacheUnclaimDeleteAllowsRetry(t *testing.T) {
 func TestHashCacheUnclaimDeleteStaleNoop(t *testing.T) {
 	var c hashCache
 	c.Reserve("k", CacheEntry{UID: "old-uid"})
-	_, deleteVersion, claimed := c.ReserveDelete("k")
+	_, deleteVersion, claimed := c.ReserveDelete("k", "")
 	if !claimed {
 		t.Fatalf("expected the claim to succeed")
 	}

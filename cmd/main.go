@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -64,6 +65,12 @@ func getEnvOrDefault(key, def string) string {
 
 // getEnvDurationOrDefault is getEnvOrDefault for time.Duration flags. An
 // unparsable value falls back to def rather than failing startup.
+//
+// This runs as a flag default-value expression, evaluated before
+// flag.Parse()/ctrl.SetLogger() in main() — setupLog isn't wired to a real
+// sink yet at this point, so a warning logged through it here would be
+// silently discarded. fmt.Fprintf to stderr is used instead so a
+// misconfigured env var is actually visible.
 func getEnvDurationOrDefault(key string, def time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
@@ -71,14 +78,15 @@ func getEnvDurationOrDefault(key string, def time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		setupLog.Error(err, "Invalid duration in environment variable, using default", "env", key, "value", v, "default", def)
+		fmt.Fprintf(os.Stderr, "kubestream: invalid duration %q for env var %s, using default %s: %v\n", v, key, def, err)
 		return def
 	}
 	return d
 }
 
 // getEnvIntOrDefault is getEnvOrDefault for int flags. An unparsable value
-// falls back to def rather than failing startup.
+// falls back to def rather than failing startup. See getEnvDurationOrDefault
+// for why this logs via stderr rather than setupLog.
 func getEnvIntOrDefault(key string, def int) int {
 	v := os.Getenv(key)
 	if v == "" {
@@ -86,7 +94,7 @@ func getEnvIntOrDefault(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		setupLog.Error(err, "Invalid integer in environment variable, using default", "env", key, "value", v, "default", def)
+		fmt.Fprintf(os.Stderr, "kubestream: invalid integer %q for env var %s, using default %d: %v\n", v, key, def, err)
 		return def
 	}
 	return n

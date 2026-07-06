@@ -115,18 +115,33 @@ func (c *hashCache) DeleteIfCurrent(key string, expectedVersion uint64) bool {
 // check on commit kept the *cache* consistent, but by then every duplicate
 // INSERT had already reached ClickHouse.
 //
-// It refuses (claimed=false) if key has no entry (nothing to delete) or the
-// entry is already claimed (someone else's delete is in flight) — either way
-// the caller has nothing new to do. Otherwise it bumps the version, exactly
-// like Reserve, so any other write already in flight for this key is
-// superseded and its eventual commit becomes a safe no-op; it returns the
-// pre-claim entry (for its UID/content) and the new version to thread into
-// the eventual DeleteIfCurrent/UnclaimDelete call.
-func (c *hashCache) ReserveDelete(key string) (entry CacheEntry, version uint64, claimed bool) {
+// It refuses (claimed=false) if key has no entry (nothing to delete), the
+// entry is already claimed (someone else's delete is in flight), or
+// expectedUID is non-empty and doesn't match the entry's current UID —
+// either way the caller has nothing new to do. Otherwise it bumps the
+// version, exactly like Reserve, so any other write already in flight for
+// this key is superseded and its eventual commit becomes a safe no-op; it
+// returns the pre-claim entry (for its UID/content) and the new version to
+// thread into the eventual DeleteIfCurrent/UnclaimDelete call.
+//
+// expectedUID matters for a caller (the startup GC pass) whose belief that
+// "this object is gone" comes from a point-in-time snapshot rather than a
+// live Get: if a live Reconcile has since reincarnated this key (deleted and
+// recreated under a new UID) and already updated the cache via Reserve, the
+// entry is present and unclaimed, so without this check the claim would
+// succeed against the *live* entry — claiming and deleting a currently-
+// existing object by name alone. Passing "" skips the check entirely, for
+// callers (the live IsNotFound path) that have no independent, possibly-
+// stale belief about which UID they expect and simply trust whatever the
+// cache currently holds.
+func (c *hashCache) ReserveDelete(key string, expectedUID string) (entry CacheEntry, version uint64, claimed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cur, present := c.data[key]
 	if !present || cur.PendingDelete {
+		return CacheEntry{}, 0, false
+	}
+	if expectedUID != "" && cur.UID != expectedUID {
 		return CacheEntry{}, 0, false
 	}
 	claimedEntry := cur

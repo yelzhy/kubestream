@@ -160,10 +160,18 @@ func (r *ResourceStreamReconciler) cacheKey(namespace, name string) string {
 // write is enqueued (long before ClickHouse confirms it), a redelivered
 // NotFound-Reconcile can easily run before the first one's commit fires. A
 // second call for the same key returns claimed=false and does nothing.
-func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logger, namespace, name string) (claimed bool, err error) {
+//
+// expectedUID lets a caller whose belief that the object is gone comes from a
+// stale, point-in-time snapshot (the startup GC pass) assert it still matches
+// the cache's current UID before claiming — otherwise a live reincarnation
+// that happened after the snapshot was taken would let this delete claim and
+// remove a currently-existing object's entry by name alone. Pass "" for the
+// live IsNotFound path, which has no independent belief to check and simply
+// trusts whatever the cache currently holds.
+func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logger, namespace, name, expectedUID string) (claimed bool, err error) {
 	objectKey := r.cacheKey(namespace, name)
 
-	entry, version, claimed := r.HashCache.ReserveDelete(objectKey)
+	entry, version, claimed := r.HashCache.ReserveDelete(objectKey, expectedUID)
 	if !claimed {
 		return false, nil
 	}
@@ -238,6 +246,7 @@ func (r *ResourceStreamReconciler) enqueueCloseOut(ctx context.Context, log logr
 	if enqueueErr != nil {
 		log.Error(enqueueErr, "🧟 Failed to queue reincarnation close-out event, will retry on next event for this name", "kind", r.GVK.Kind, "namespace", record.Namespace, "name", record.Name, "old_uid", record.UID)
 		r.closeOuts.Add(objectKey, record)
+		r.requeue(record.Namespace, record.Name)
 	}
 }
 
@@ -268,10 +277,10 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	err := r.Get(ctx, req.NamespacedName, obj)
 
-	// --- БЛОК ОБРАБОТКИ УДАЛЕНИЯ (IsNotFound) ---
+	// --- DELETE HANDLING BLOCK (IsNotFound) ---
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			if _, enqueueErr := r.emitDelete(ctx, log, req.Namespace, req.Name); enqueueErr != nil {
+			if _, enqueueErr := r.emitDelete(ctx, log, req.Namespace, req.Name, ""); enqueueErr != nil {
 				return ctrl.Result{}, enqueueErr
 			}
 			return ctrl.Result{}, nil
@@ -279,7 +288,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// --- БЛОК НОРМАЛИЗАЦИИ ---
+	// --- NORMALIZATION BLOCK ---
 	originalRV := obj.GetResourceVersion()
 	currentUID := string(obj.GetUID())
 
@@ -310,9 +319,9 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// state" (delete the key entirely on failure).
 	var revertEntry *CacheEntry
 
-	// --- БЛОК ДЕДУПЛИКАЦИИ И РЕИНКАРНАЦИИ ---
+	// --- DEDUPLICATION AND REINCARNATION BLOCK ---
 	if cachedEntry, exists := r.HashCache.Load(objectKey); exists {
-		// 🚨 МАГИЯ ПРОТИВ ЗОМБИ: Проверяем UID!
+		// 🚨 ANTI-ZOMBIE MAGIC: check the UID!
 		if cachedEntry.UID != "" && cachedEntry.UID != currentUID {
 			log.Info("🧟 Reincarnation! Old object died during downtime — closing its history and treating the current one as Added", "name", req.Name)
 
@@ -339,18 +348,18 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					SHA256:     "DELETED",
 				}
 
-				// 1. Закрываем историю старого объекта — failures are
+				// 1. Close out the old object's history — failures are
 				// remembered and retried (see enqueueCloseOut), not just
 				// logged, so this historical record can't be silently lost.
 				r.enqueueCloseOut(ctx, log, objectKey, closeRecord)
 			}
 
-			// 2. Текущий объект обрабатывается как чистый Added (оставляем eventType = "Added").
+			// 2. The current object is treated as a plain Added (leave eventType = "Added").
 			// There is no confirmed prior state for THIS UID, so revertEntry stays nil.
 		} else {
-			// Обычная логика (объект тот же самый)
+			// Ordinary logic (same object)
 			if cachedEntry.Hash == hashString {
-				return ctrl.Result{}, nil // Дубликат
+				return ctrl.Result{}, nil // Duplicate
 			}
 
 			eventType = "Modified"
@@ -421,7 +430,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		SHA256:          hashString,
 	}
 
-	// --- БЛОК ЭКСПОРТА ---
+	// --- EXPORT BLOCK ---
 	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
 		query: insertResourceStateQuery,
 		args:  record.insertArgs(),
@@ -481,7 +490,7 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 	// manager's via mgr.Add. insertTimeout is chConfig.ReadTimeout, so the
 	// operator-configured value actually governs the async write path (not
 	// just the connection's own driver-level timeout).
-	chWriter := NewCHWriter(conn, 0, 0, chConfig.ReadTimeout, 0)
+	chWriter := NewCHWriter(conn, 0, 0, chConfig.ReadTimeout, 0, 0)
 
 	// connUsers tracks goroutines besides CHWriter's own workers that still
 	// need conn (namely restoreAndWarm, below) — CHWriter waits for this to
@@ -631,7 +640,7 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 	}
 
 	// ==========================================
-	// 🕵️‍♂️ Garbage Collector (з перевіркою UID)
+	// 🕵️‍♂️ Garbage Collector (with UID verification)
 	// ==========================================
 	if !mgr.GetCache().WaitForCacheSync(ctx) {
 		return nil
@@ -645,11 +654,19 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 
 		getErr := mgr.GetClient().Get(ctx, reqKey, obj)
 
-		// Зомбі виявлено, якщо об'єкта немає АБО якщо його UID змінився
+		// A zombie is either an object that's gone entirely, or one whose
+		// current UID no longer matches the UID this GC pass believes it
+		// should have (i.e. it was deleted and recreated since the ClickHouse
+		// snapshot was taken).
 		isZombie := false
-		if getErr != nil && apierrors.IsNotFound(getErr) {
-			isZombie = true
-		} else if getErr == nil && string(obj.GetUID()) != target.UID {
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				isZombie = true
+			} else {
+				log.Error(getErr, "🧟 Failed to check whether object still exists, skipping this target", "kind", gvk.Kind, "namespace", target.Namespace, "name", target.Name)
+				continue
+			}
+		} else if string(obj.GetUID()) != target.UID {
 			isZombie = true
 		}
 
@@ -663,8 +680,13 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 		// targetsToCheck and getting here, claimed comes back false and
 		// there is nothing left for the GC pass to do — without this shared
 		// claim, both would independently enqueue their own "Deleted" row
-		// for the same object.
-		claimed, enqueueErr := reconciler.emitDelete(ctx, log, reqKey.Namespace, reqKey.Name)
+		// for the same object. expectedUID=target.UID additionally guards
+		// against a live reincarnation that happened in that same window:
+		// if a Reconcile already recreated this object under a new UID and
+		// Reserve'd the cache accordingly, target.UID no longer matches the
+		// live entry, so the claim is refused instead of deleting a
+		// currently-existing object by name alone.
+		claimed, enqueueErr := reconciler.emitDelete(ctx, log, reqKey.Namespace, reqKey.Name, target.UID)
 		if enqueueErr != nil {
 			log.Error(enqueueErr, "🧟 Failed to queue zombie cleanup event", "kind", gvk.Kind, "name", reqKey.Name)
 			continue
