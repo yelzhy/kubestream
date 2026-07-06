@@ -54,7 +54,6 @@ var errAsyncWriteFailed = errors.New("clickhouse write did not succeed after ret
 type ResourceStreamReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
-	CHConn    driver.Conn
 	CHWriter  *CHWriter
 	HashCache hashCache
 	GVK       schema.GroupVersionKind
@@ -482,7 +481,6 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 	if err != nil {
 		return err
 	}
-	r.CHConn = conn
 
 	// CHWriter decouples every ClickHouse insert from the Reconcile hot path
 	// (see chwriter.go). One instance is shared across all watched GVKs; its
@@ -520,7 +518,6 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 		reconciler := &ResourceStreamReconciler{
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
-			CHConn:    conn,
 			CHWriter:  chWriter,
 			GVK:       gvk,
 			ClusterID: reconcilerConfig.ClusterID,
@@ -581,10 +578,10 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 		rows, err := conn.Query(ctx, `
             SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts)
             FROM resource_states
-            WHERE kind = ?
+            WHERE kind = ? AND cluster_id = ?
             GROUP BY namespace, name
             HAVING argMax(event_type, ts) != 'Deleted'
-        `, gvk.Kind)
+        `, gvk.Kind, reconciler.ClusterID)
 		if err != nil {
 			return err
 		}
@@ -594,7 +591,7 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 		for rows.Next() {
 			var namespace, name, uid, hash string
 			if err := rows.Scan(&namespace, &name, &uid, &hash); err != nil {
-				continue
+				return err
 			}
 			key := reconciler.cacheKey(namespace, name)
 
@@ -609,6 +606,15 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 			})
 			restoredCount++
 			targetsToCheck = append(targetsToCheck, gcTarget{Namespace: namespace, Name: name, UID: uid})
+		}
+		// A mid-stream failure (e.g. the connection dropping) makes rows.Next()
+		// return false exactly like a clean EOF — only rows.Err() distinguishes
+		// the two. Treating a partial result as success here would clear
+		// SafeMode having silently under-restored the cache, so a scan error
+		// (above) or a stream error (here) must both fail the whole attempt
+		// and let backoff.Retry try again from scratch.
+		if err := rows.Err(); err != nil {
+			return err
 		}
 		log.Info("✅ Cache warmed", "kind", gvk.Kind, "objects_loaded", restoredCount)
 		return nil
