@@ -324,15 +324,17 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if cachedEntry.UID != "" && cachedEntry.UID != currentUID {
 			log.Info("🧟 Reincarnation! Old object died during downtime — closing its history and treating the current one as Added", "name", req.Name)
 
-			// If a delete for the old incarnation is already claimed (see
-			// hashCache.ReserveDelete) — e.g. a NotFound-Reconcile for it
-			// already ran and is mid-flight — that write will land in
-			// ClickHouse on its own. Enqueuing a second close-out row here
-			// would duplicate it, so skip straight to treating the current
-			// object as Added.
-			if cachedEntry.PendingDelete {
-				log.Info("🧟 Old incarnation's deletion already claimed elsewhere, skipping close-out write", "kind", r.GVK.Kind, "name", req.Name, "old_uid", cachedEntry.UID)
-			} else {
+			// Claim the old incarnation's delete atomically via
+			// ReserveDelete instead of trusting the cachedEntry.PendingDelete
+			// value snapshotted by the Load above — that read and this
+			// branch are not atomic with respect to a concurrent claim by
+			// the live IsNotFound path or the startup GC pass, both of
+			// which claim through this exact same primitive (via
+			// emitDelete) for the very same key. Without this, both this
+			// branch and a concurrent emitDelete call could each observe
+			// "not yet claimed" and independently enqueue their own
+			// "Deleted" row for the same old UID.
+			if claimedEntry, _, claimed := r.HashCache.ReserveDelete(objectKey, cachedEntry.UID); claimed {
 				closeRecord := ResourceRecord{
 					Timestamp:  time.Now().UTC(),
 					ClusterID:  r.ClusterID,
@@ -342,7 +344,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					Kind:       r.GVK.Kind,
 					Namespace:  req.Namespace,
 					Name:       req.Name,
-					UID:        cachedEntry.UID,
+					UID:        claimedEntry.UID,
 					Data:       `{"status": "deleted"}`,
 					SHA256:     "DELETED",
 				}
@@ -350,7 +352,16 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				// 1. Close out the old object's history — failures are
 				// remembered and retried (see enqueueCloseOut), not just
 				// logged, so this historical record can't be silently lost.
+				// The claim above is immediately superseded by this
+				// Reconcile's own Reserve for the new incarnation a few
+				// lines below, so ReserveDelete's version-gated commit
+				// (DeleteIfCurrent/UnclaimDelete) becomes a safe no-op once
+				// that happens — it's enqueueCloseOut's own closeOuts-based
+				// retry, not the claim, that carries this write forward on
+				// failure.
 				r.enqueueCloseOut(ctx, log, objectKey, closeRecord)
+			} else {
+				log.Info("🧟 Old incarnation's deletion already claimed elsewhere, skipping close-out write", "kind", r.GVK.Kind, "name", req.Name, "old_uid", cachedEntry.UID)
 			}
 
 			// 2. The current object is treated as a plain Added (leave eventType = "Added").
