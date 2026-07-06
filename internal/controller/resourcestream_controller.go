@@ -214,6 +214,7 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 	if enqueueErr != nil {
 		log.Error(enqueueErr, "🗑️ Failed to queue deletion event, releasing claim", "kind", r.GVK.Kind, "namespace", namespace, "name", name)
 		r.HashCache.UnclaimDelete(objectKey, version)
+		r.requeue(namespace, name)
 		return true, enqueueErr
 	}
 	return true, nil
@@ -318,6 +319,17 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// state" (delete the key entirely on failure).
 	var revertEntry *CacheEntry
 
+	// cacheMiss records whether this Reconcile found no cache entry at all
+	// for objectKey — the one case the SafeMode Snapshot fallback below
+	// exists to guard, since it's genuinely ambiguous whether "Added" means
+	// "truly new" or "not yet warmed from ClickHouse history." A
+	// reincarnation (cache hit, UID mismatch) is never ambiguous this way —
+	// Reconcile has direct proof (the stored old UID vs. the live new UID)
+	// that this is a real, current state transition, so it must always be
+	// recorded as "Added," never downgraded to "Snapshot," regardless of
+	// SafeMode.
+	var cacheMiss bool
+
 	// --- DEDUPLICATION AND REINCARNATION BLOCK ---
 	if cachedEntry, exists := r.HashCache.Load(objectKey); exists {
 		// 🚨 ANTI-ZOMBIE MAGIC: check the UID!
@@ -389,13 +401,17 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	} else {
 		log.Info("🌟 New object observed", "kind", r.GVK.Kind, "name", req.Name)
+		cacheMiss = true
 	}
 
-	// A cache-miss (eventType still "Added") during SafeMode can't be
-	// trusted to mean "genuinely new" — the cache may simply not be warmed
-	// yet. Tag it Snapshot so a slow/unavailable ClickHouse at startup
-	// never masquerades as a mass "Added" duplicate-write storm.
-	if eventType == "Added" && r.SafeMode.Load() {
+	// A genuine cache-miss during SafeMode can't be trusted to mean
+	// "genuinely new" — the cache may simply not be warmed yet. Tag it
+	// Snapshot so a slow/unavailable ClickHouse at startup never
+	// masquerades as a mass "Added" duplicate-write storm. This
+	// intentionally does not cover the reincarnation branch above, which
+	// also reaches this point with eventType == "Added" but is never
+	// ambiguous — see cacheMiss's doc comment.
+	if cacheMiss && r.SafeMode.Load() {
 		eventType = "Snapshot"
 		log.Info("🌱 Cache not yet warmed, tagging as Snapshot", "kind", r.GVK.Kind, "name", req.Name)
 	}
