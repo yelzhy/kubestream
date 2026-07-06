@@ -74,6 +74,44 @@ type ResourceStreamReconciler struct {
 	// Wired into the controller via WatchesRawSource(source.Channel(...)) in
 	// SetupWithManager.
 	requeueCh chan event.GenericEvent
+	// closeOuts tracks reincarnation close-out writes (see the UID-mismatch
+	// branch in Reconcile) that failed and are awaiting retry. It's separate
+	// from HashCache because HashCache's entry for a key is immediately
+	// overwritten with the new incarnation's live state by Reserve — there is
+	// nowhere in HashCache to durably remember "the old UID's close-out still
+	// needs to happen" without a newer write clobbering it.
+	closeOuts closeOutRetryQueue
+}
+
+// closeOutRetryQueue is a mutex-protected map from cacheKey to the
+// ResourceRecords still awaiting a successful close-out write for that key.
+// A slice, not a single record, because a second reincarnation could in
+// principle occur for the same name before the first close-out resolves;
+// this way that (rare) case queues up rather than one write silently
+// replacing tracking of the other.
+type closeOutRetryQueue struct {
+	mu   sync.Mutex
+	data map[string][]ResourceRecord
+}
+
+// Add appends record to key's pending list, to be retried on a later call to
+// TakeAll for the same key.
+func (q *closeOutRetryQueue) Add(key string, record ResourceRecord) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.data == nil {
+		q.data = make(map[string][]ResourceRecord)
+	}
+	q.data[key] = append(q.data[key], record)
+}
+
+// TakeAll returns and clears key's pending records, if any.
+func (q *closeOutRetryQueue) TakeAll(key string) []ResourceRecord {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	records := q.data[key]
+	delete(q.data, key)
+	return records
 }
 
 // requeue asks controller-runtime to re-Reconcile namespace/name for this
@@ -174,6 +212,47 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 	return true, nil
 }
 
+// enqueueCloseOut submits a reincarnation close-out write (a "Deleted" row
+// for a UID that's been superseded by a same-named recreate). Unlike
+// emitDelete, it has no cache entry of its own to gate or settle — by the
+// time this runs, HashCache's entry for objectKey is about to be (or already
+// has been) overwritten with the new incarnation's live state. So instead of
+// a version-gated commit, a failure (whether the enqueue itself or the write
+// after CHWriter's own retries) is remembered in closeOuts and a fresh
+// Reconcile is requested; retryPendingCloseOuts re-attempts it on that (or
+// any later) Reconcile for this key, so a permanently-failed attempt keeps
+// getting retried instead of the historical record silently vanishing.
+func (r *ResourceStreamReconciler) enqueueCloseOut(ctx context.Context, log logr.Logger, objectKey string, record ResourceRecord) {
+	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
+		query: insertResourceStateQuery,
+		args:  record.insertArgs(),
+		commit: func(ok bool) {
+			if ok {
+				return
+			}
+			log.Error(errAsyncWriteFailed, "🧟 Failed to close out reincarnated object's history, will retry on next event for this name", "kind", r.GVK.Kind, "namespace", record.Namespace, "name", record.Name, "old_uid", record.UID)
+			r.closeOuts.Add(objectKey, record)
+			r.requeue(record.Namespace, record.Name)
+		},
+	})
+	if enqueueErr != nil {
+		log.Error(enqueueErr, "🧟 Failed to queue reincarnation close-out event, will retry on next event for this name", "kind", r.GVK.Kind, "namespace", record.Namespace, "name", record.Name, "old_uid", record.UID)
+		r.closeOuts.Add(objectKey, record)
+	}
+}
+
+// retryPendingCloseOuts re-attempts any reincarnation close-out writes still
+// pending for objectKey (see closeOuts). Called unconditionally at the top
+// of Reconcile so a previously-failed close-out gets retried on the very
+// next event for this name — including the fresh Reconcile that
+// enqueueCloseOut's failure path explicitly triggers via requeue — rather
+// than only ever being attempted once.
+func (r *ResourceStreamReconciler) retryPendingCloseOuts(ctx context.Context, log logr.Logger, objectKey string) {
+	for _, record := range r.closeOuts.TakeAll(objectKey) {
+		r.enqueueCloseOut(ctx, log, objectKey, record)
+	}
+}
+
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
@@ -184,8 +263,10 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(r.GVK)
 
-	err := r.Get(ctx, req.NamespacedName, obj)
 	objectKey := r.cacheKey(req.Namespace, req.Name)
+	r.retryPendingCloseOuts(ctx, log, objectKey)
+
+	err := r.Get(ctx, req.NamespacedName, obj)
 
 	// --- БЛОК ОБРАБОТКИ УДАЛЕНИЯ (IsNotFound) ---
 	if err != nil {
@@ -257,22 +338,11 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					Data:       `{"status": "deleted"}`,
 					SHA256:     "DELETED",
 				}
-				oldUID := cachedEntry.UID
 
-				// 1. Закрываем историю старого объекта (async, best-effort logged on failure)
-				enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
-					query: insertResourceStateQuery,
-					args:  closeRecord.insertArgs(),
-					commit: func(ok bool) {
-						if !ok {
-							log.Error(errAsyncWriteFailed, "🧟 Failed to close out reincarnated object's history", "kind", r.GVK.Kind, "name", req.Name, "old_uid", oldUID)
-						}
-					},
-				})
-				if enqueueErr != nil {
-					log.Error(enqueueErr, "🧟 Failed to queue reincarnation close-out event, requeuing", "kind", r.GVK.Kind, "name", req.Name)
-					return ctrl.Result{}, enqueueErr
-				}
+				// 1. Закрываем историю старого объекта — failures are
+				// remembered and retried (see enqueueCloseOut), not just
+				// logged, so this historical record can't be silently lost.
+				r.enqueueCloseOut(ctx, log, objectKey, closeRecord)
 			}
 
 			// 2. Текущий объект обрабатывается как чистый Added (оставляем eventType = "Added").
