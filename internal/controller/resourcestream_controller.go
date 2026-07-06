@@ -262,6 +262,14 @@ func (r *ResourceStreamReconciler) retryPendingCloseOuts(ctx context.Context, lo
 	}
 }
 
+// The markers below grant exactly what the default WATCHED_GVKS list
+// (v1/Pod, apps/v1/Deployment, v1/Service — see cmd/main.go) needs.
+// Kubernetes RBAC is a static, server-side resource; it cannot be made
+// dynamic from this Go code. If WATCHED_GVKS is overridden to add a
+// resource type these markers don't cover (including a CRD), the
+// operator's ClusterRole (config/rbac/role.yaml, regenerated from markers
+// like these via `make manifests`) must be extended to match, or that
+// GVK's watch will fail at startup with a Forbidden error.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
@@ -528,10 +536,16 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 		return err
 	}
 
-	gvksToWatch := []schema.GroupVersionKind{
-		{Group: "", Version: "v1", Kind: "Pod"},
-		{Group: "", Version: "v1", Kind: "Service"},
-		{Group: "apps", Version: "v1", Kind: "Deployment"},
+	// gvksToWatch comes from ReconcilerConfig (sourced from WATCHED_GVKS /
+	// --watched-gvks in cmd/main.go) rather than a hardcoded slice, so
+	// watching a new resource type — including a CRD — is a config change,
+	// not a code change + rebuild. See the RBAC caveat on the kubebuilder
+	// markers above Reconcile: this does not, and cannot, dynamically grant
+	// the RBAC permissions a newly-added GVK needs — that's still a
+	// separate, static Kubernetes resource.
+	gvksToWatch := reconcilerConfig.WatchedGVKs
+	if len(gvksToWatch) == 0 {
+		return errors.New("no watched GVKs configured: WatchedGVKs is empty")
 	}
 
 	log := logf.Log.WithName("setup")

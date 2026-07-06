@@ -2,6 +2,8 @@ package controller
 
 import (
 	"time"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // CacheEntry holds the in-memory cached state for one object (see hashCache).
@@ -68,6 +70,16 @@ type ReconcilerConfig struct {
 	// CHWriter) — but it's still a bound, not unlimited, so throughput
 	// can't grow without limit under event floods.
 	MaxConcurrentReconciles int
+	// WatchedGVKs is the set of resource types (including any CRD) this
+	// operator watches and streams to ClickHouse. cmd/main.go sources it
+	// from the WATCHED_GVKS env var / --watched-gvks flag (see its
+	// parseGVKList) rather than a hardcoded Go slice, so adding a new type
+	// is a config change, not a code change. Kubernetes RBAC is still a
+	// static, server-side resource, though — watching a GVK outside the
+	// operator's default ClusterRole (config/rbac/role.yaml) additionally
+	// requires that role to be extended to grant it; see the kubebuilder
+	// markers on ResourceStreamReconciler.Reconcile.
+	WatchedGVKs []schema.GroupVersionKind
 }
 
 // insertArgs returns the positional arguments for the resource_states INSERT

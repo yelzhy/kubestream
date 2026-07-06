@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -29,6 +30,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -46,6 +48,10 @@ var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+// defaultWatchedGVKs is used when WATCHED_GVKS/--watched-gvks is unset or
+// empty, so the operator watches something sensible out of the box.
+const defaultWatchedGVKs = "v1/Pod,apps/v1/Deployment,v1/Service"
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -100,6 +106,43 @@ func getEnvIntOrDefault(key string, def int) int {
 	return n
 }
 
+// parseGVKList parses a comma-separated list of GroupVersionKinds, each
+// given as "version/kind" (core group, e.g. "v1/Pod") or
+// "group/version/kind" (e.g. "apps/v1/Deployment",
+// "networking.k8s.io/v1/Ingress"), into the GVKs the operator should watch.
+// Externalizing this list — rather than a hardcoded Go slice in
+// resourcestream_controller.go — is what lets the operator watch a
+// different set of resource types, including CRDs, purely through
+// configuration; see ReconcilerConfig.WatchedGVKs.
+//
+// Returns an error naming the malformed entry on invalid input, rather than
+// silently skipping it — a typo here should fail startup loudly, not
+// quietly watch fewer resource types than intended.
+func parseGVKList(raw string) ([]schema.GroupVersionKind, error) {
+	var gvks []schema.GroupVersionKind
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		var gvk schema.GroupVersionKind
+		switch parts := strings.Split(entry, "/"); len(parts) {
+		case 2:
+			gvk = schema.GroupVersionKind{Version: parts[0], Kind: parts[1]}
+		case 3:
+			gvk = schema.GroupVersionKind{Group: parts[0], Version: parts[1], Kind: parts[2]}
+		default:
+			return nil, fmt.Errorf(`invalid GVK %q: expected "version/kind" or "group/version/kind"`, entry)
+		}
+		if gvk.Version == "" || gvk.Kind == "" {
+			return nil, fmt.Errorf("invalid GVK %q: version and kind must not be empty", entry)
+		}
+		gvks = append(gvks, gvk)
+	}
+	return gvks, nil
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -127,10 +170,16 @@ func main() {
 	// avoids.
 	var clusterID string
 	var maxConcurrentReconciles int
+	var watchedGVKsRaw string
 	flag.StringVar(&clusterID, "cluster-id", getEnvOrDefault("CLUSTER_ID", "local-kind-cluster"),
 		"Identifier for this cluster, recorded on every row written to ClickHouse. Can also be set via the CLUSTER_ID env var.")
 	flag.IntVar(&maxConcurrentReconciles, "reconciler-max-concurrent", getEnvIntOrDefault("RECONCILER_MAX_CONCURRENT", 5),
 		"Maximum concurrent Reconciles per watched resource type. Can also be set via the RECONCILER_MAX_CONCURRENT env var.")
+	flag.StringVar(&watchedGVKsRaw, "watched-gvks", getEnvOrDefault("WATCHED_GVKS", defaultWatchedGVKs),
+		"Comma-separated list of resource types to watch, each as \"version/kind\" or \"group/version/kind\" "+
+			"(e.g. \"v1/Pod,apps/v1/Deployment,networking.k8s.io/v1/Ingress\"). Adding a type outside the "+
+			"operator's default RBAC grant also requires extending config/rbac/role.yaml. Can also be set via "+
+			"the WATCHED_GVKS env var.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -259,9 +308,21 @@ func main() {
 		setupLog.Info("CH_PASSWORD is not set; connecting to ClickHouse without a password")
 	}
 
+	watchedGVKs, err := parseGVKList(watchedGVKsRaw)
+	if err != nil {
+		setupLog.Error(err, "Invalid --watched-gvks/WATCHED_GVKS configuration")
+		os.Exit(1)
+	}
+	if len(watchedGVKs) == 0 {
+		setupLog.Error(fmt.Errorf("--watched-gvks/WATCHED_GVKS resolved to an empty list"),
+			"The operator must watch at least one resource type")
+		os.Exit(1)
+	}
+
 	reconcilerConfig := controller.ReconcilerConfig{
 		ClusterID:               clusterID,
 		MaxConcurrentReconciles: maxConcurrentReconciles,
+		WatchedGVKs:             watchedGVKs,
 	}
 
 	if err := (&controller.ResourceStreamReconciler{
