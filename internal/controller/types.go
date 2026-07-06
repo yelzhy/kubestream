@@ -15,6 +15,13 @@ type CacheEntry struct {
 	// the write was issued, so an out-of-order (but stale) commit can never
 	// clobber a newer write's result. See hashcache.go.
 	Version uint64
+	// PendingDelete is set by hashCache.ReserveDelete while a "Deleted" write
+	// for this key is in flight. It's what lets the live delete path and the
+	// startup GC pass share one claim: whichever of them notices the object
+	// is gone first claims it and flips this on; anyone else who notices the
+	// same disappearance before the claim resolves sees it already set and
+	// does not enqueue a second write. See hashcache.go.
+	PendingDelete bool
 }
 
 // ResourceRecord - это универсальная структура для отправки в ClickHouse

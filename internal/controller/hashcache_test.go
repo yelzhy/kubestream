@@ -110,6 +110,89 @@ func TestHashCacheStoreIfAbsentDoesNotClobberLiveEntry(t *testing.T) {
 	}
 }
 
+// TestHashCacheReserveDeleteClaimsOnce reproduces the redelivery scenario
+// behind the delete-path duplicate-write bug: two Reconciles both notice the
+// same object is gone before the first one's write is confirmed. Without a
+// claim, both would independently enqueue a "Deleted" row. With it, the
+// second ReserveDelete call must see the claim already in place and refuse.
+func TestHashCacheReserveDeleteClaimsOnce(t *testing.T) {
+	var c hashCache
+	c.Reserve("k", CacheEntry{UID: "uid-1"})
+
+	entry, version, claimed := c.ReserveDelete("k")
+	if !claimed {
+		t.Fatalf("expected the first ReserveDelete to claim the key")
+	}
+	if entry.UID != "uid-1" {
+		t.Fatalf("expected the claimed entry to carry the pre-claim UID, got %+v", entry)
+	}
+
+	if _, _, claimedAgain := c.ReserveDelete("k"); claimedAgain {
+		t.Fatalf("a second ReserveDelete must not claim a key that's already pending delete")
+	}
+
+	if ok := c.DeleteIfCurrent("k", version); !ok {
+		t.Fatalf("DeleteIfCurrent should apply using the version ReserveDelete returned")
+	}
+	if _, exists := c.Load("k"); exists {
+		t.Fatalf("expected the entry to be gone after the claimed delete committed")
+	}
+}
+
+// TestHashCacheReserveDeleteNothingToDelete covers the ordinary case: the
+// key was never known (or was already removed), so there's nothing to claim.
+func TestHashCacheReserveDeleteNothingToDelete(t *testing.T) {
+	var c hashCache
+	if _, _, claimed := c.ReserveDelete("missing"); claimed {
+		t.Fatalf("ReserveDelete must not claim a key with no entry")
+	}
+}
+
+// TestHashCacheUnclaimDeleteAllowsRetry ensures a failed delete write
+// releases its claim so a subsequent attempt (e.g. via requeue) can succeed.
+func TestHashCacheUnclaimDeleteAllowsRetry(t *testing.T) {
+	var c hashCache
+	c.Reserve("k", CacheEntry{UID: "uid-1"})
+
+	_, version, claimed := c.ReserveDelete("k")
+	if !claimed {
+		t.Fatalf("expected the claim to succeed")
+	}
+
+	c.UnclaimDelete("k", version)
+
+	entry, exists := c.Load("k")
+	if !exists || entry.PendingDelete {
+		t.Fatalf("expected the claim to be released and the entry to remain, got %+v (exists=%v)", entry, exists)
+	}
+
+	if _, _, claimedAgain := c.ReserveDelete("k"); !claimedAgain {
+		t.Fatalf("expected a fresh ReserveDelete to succeed once the prior claim was released")
+	}
+}
+
+// TestHashCacheUnclaimDeleteStaleNoop reproduces the reincarnation race: a
+// delete is claimed, then the object comes back under a new UID (Reserve)
+// before the original delete's write settles. The stale UnclaimDelete must
+// not touch the newer live entry.
+func TestHashCacheUnclaimDeleteStaleNoop(t *testing.T) {
+	var c hashCache
+	c.Reserve("k", CacheEntry{UID: "old-uid"})
+	_, deleteVersion, claimed := c.ReserveDelete("k")
+	if !claimed {
+		t.Fatalf("expected the claim to succeed")
+	}
+
+	c.Reserve("k", CacheEntry{UID: "new-uid"}) // reincarnation supersedes the claim
+
+	c.UnclaimDelete("k", deleteVersion)
+
+	entry, exists := c.Load("k")
+	if !exists || entry.UID != "new-uid" || entry.PendingDelete {
+		t.Fatalf("stale UnclaimDelete must not disturb the newer live entry, got %+v (exists=%v)", entry, exists)
+	}
+}
+
 // TestHashCacheConcurrentReserveCommit exercises Reserve/CommitIfCurrent
 // under concurrent access (run with -race) to catch any lock-ordering bug
 // in hashCache itself, independent of Reconcile's usage of it.

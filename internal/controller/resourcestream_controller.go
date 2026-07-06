@@ -97,6 +97,83 @@ func (r *ResourceStreamReconciler) requeue(namespace, name string) {
 	}
 }
 
+// cacheKey builds the hashCache key for a namespace/name pair under this
+// reconciler's GVK. The single canonical builder, used by Reconcile,
+// emitDelete, and restoreAndWarm, so a cache entry written under one code
+// path is always found by the others — namespaced and cluster-scoped names
+// alike (client.ObjectKey.String() always renders as "namespace/name", even
+// when namespace is empty, which req.NamespacedName.String() already relies
+// on; hand-rolling this per call site previously let it drift, harmlessly
+// today since every watched GVK is namespaced, but silently, had a
+// cluster-scoped GVK ever been added).
+func (r *ResourceStreamReconciler) cacheKey(namespace, name string) string {
+	return r.GVK.Kind + "/" + (client.ObjectKey{Namespace: namespace, Name: name}).String()
+}
+
+// emitDelete is the single place a "Deleted" row is ever enqueued. Both the
+// live delete path (Reconcile, on IsNotFound) and the startup GC pass
+// (restoreAndWarm's zombie cleanup) detect the same condition — this object
+// is gone but the cache still holds its last-known state — and must claim
+// through the same hashCache.ReserveDelete so they can never both emit a
+// duplicate "Deleted" row for the same disappearance. It also protects
+// against plain redelivery: controller-runtime's workqueue guarantees at
+// least one more Reconcile for a key that was touched again while the
+// current one was processing, and since a Reconcile returns as soon as the
+// write is enqueued (long before ClickHouse confirms it), a redelivered
+// NotFound-Reconcile can easily run before the first one's commit fires. A
+// second call for the same key returns claimed=false and does nothing.
+func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logger, namespace, name string) (claimed bool, err error) {
+	objectKey := r.cacheKey(namespace, name)
+
+	entry, version, claimed := r.HashCache.ReserveDelete(objectKey)
+	if !claimed {
+		return false, nil
+	}
+
+	log.Info("🗑️ Object gone, queuing Deleted event for ClickHouse", "kind", r.GVK.Kind, "namespace", namespace, "name", name, "uid", entry.UID)
+
+	record := ResourceRecord{
+		Timestamp:  time.Now().UTC(),
+		ClusterID:  r.ClusterID,
+		EventType:  "Deleted",
+		APIGroup:   r.GVK.Group,
+		APIVersion: r.GVK.Version,
+		Kind:       r.GVK.Kind,
+		Namespace:  namespace,
+		Name:       name,
+		UID:        entry.UID,
+		Data:       `{"status": "deleted"}`,
+		SHA256:     "DELETED",
+	}
+
+	// The cache entry is only removed once the deletion record is durably
+	// written (see commit) — never before — so a crash or write failure
+	// can't silently drop this object from history. On failure, the claim is
+	// released (not the whole entry) so a later attempt can retry; a stale
+	// release from a superseded claim (e.g. the object was recreated under a
+	// new UID while this write was in flight) is a safe no-op — see
+	// UnclaimDelete.
+	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
+		query: insertResourceStateQuery,
+		args:  record.insertArgs(),
+		commit: func(ok bool) {
+			if ok {
+				r.HashCache.DeleteIfCurrent(objectKey, version)
+				return
+			}
+			log.Error(errAsyncWriteFailed, "🗑️ Deletion write failed, releasing claim so it is retried", "kind", r.GVK.Kind, "namespace", namespace, "name", name)
+			r.HashCache.UnclaimDelete(objectKey, version)
+			r.requeue(namespace, name)
+		},
+	})
+	if enqueueErr != nil {
+		log.Error(enqueueErr, "🗑️ Failed to queue deletion event, releasing claim", "kind", r.GVK.Kind, "namespace", namespace, "name", name)
+		r.HashCache.UnclaimDelete(objectKey, version)
+		return true, enqueueErr
+	}
+	return true, nil
+}
+
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
@@ -108,52 +185,13 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	obj.SetGroupVersionKind(r.GVK)
 
 	err := r.Get(ctx, req.NamespacedName, obj)
-	objectKey := r.GVK.Kind + "/" + req.NamespacedName.String()
+	objectKey := r.cacheKey(req.Namespace, req.Name)
 
 	// --- БЛОК ОБРАБОТКИ УДАЛЕНИЯ (IsNotFound) ---
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			if cachedEntry, exists := r.HashCache.Load(objectKey); exists {
-				log.Info("🗑️ Object deleted, queuing event for ClickHouse write", "kind", r.GVK.Kind, "name", req.Name, "uid", cachedEntry.UID)
-
-				record := ResourceRecord{
-					Timestamp:  time.Now().UTC(),
-					ClusterID:  r.ClusterID,
-					EventType:  "Deleted",
-					APIGroup:   r.GVK.Group,
-					APIVersion: r.GVK.Version,
-					Kind:       r.GVK.Kind,
-					Namespace:  req.Namespace,
-					Name:       req.Name,
-					UID:        cachedEntry.UID,
-					Data:       `{"status": "deleted"}`,
-					SHA256:     "DELETED",
-				}
-				expectedVersion := cachedEntry.Version
-
-				// The cache entry is only removed once the deletion record is
-				// durably written (see commit) — never before — so a crash or
-				// write failure can't silently drop this object from history.
-				// The version check guards against a rarer case: the object
-				// being deleted and quickly recreated (new UID) while this job
-				// is still in flight — DeleteIfCurrent then correctly leaves
-				// the newer incarnation's cache entry alone instead of wiping
-				// it out from under it.
-				enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
-					query: insertResourceStateQuery,
-					args:  record.insertArgs(),
-					commit: func(ok bool) {
-						if ok {
-							r.HashCache.DeleteIfCurrent(objectKey, expectedVersion)
-							return
-						}
-						log.Error(errAsyncWriteFailed, "🗑️ Deletion write failed, cache left untouched so it is retried", "kind", r.GVK.Kind, "name", req.Name)
-					},
-				})
-				if enqueueErr != nil {
-					log.Error(enqueueErr, "🗑️ Failed to queue deletion event, requeuing", "kind", r.GVK.Kind, "name", req.Name)
-					return ctrl.Result{}, enqueueErr
-				}
+			if _, enqueueErr := r.emitDelete(ctx, log, req.Namespace, req.Name); enqueueErr != nil {
+				return ctrl.Result{}, enqueueErr
 			}
 			return ctrl.Result{}, nil
 		}
@@ -197,34 +235,44 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if cachedEntry.UID != "" && cachedEntry.UID != currentUID {
 			log.Info("🧟 Reincarnation! Old object died during downtime — closing its history and treating the current one as Added", "name", req.Name)
 
-			closeRecord := ResourceRecord{
-				Timestamp:  time.Now().UTC(),
-				ClusterID:  r.ClusterID,
-				EventType:  "Deleted",
-				APIGroup:   r.GVK.Group,
-				APIVersion: r.GVK.Version,
-				Kind:       r.GVK.Kind,
-				Namespace:  req.Namespace,
-				Name:       req.Name,
-				UID:        cachedEntry.UID,
-				Data:       `{"status": "deleted"}`,
-				SHA256:     "DELETED",
-			}
-			oldUID := cachedEntry.UID
+			// If a delete for the old incarnation is already claimed (see
+			// hashCache.ReserveDelete) — e.g. a NotFound-Reconcile for it
+			// already ran and is mid-flight — that write will land in
+			// ClickHouse on its own. Enqueuing a second close-out row here
+			// would duplicate it, so skip straight to treating the current
+			// object as Added.
+			if cachedEntry.PendingDelete {
+				log.Info("🧟 Old incarnation's deletion already claimed elsewhere, skipping close-out write", "kind", r.GVK.Kind, "name", req.Name, "old_uid", cachedEntry.UID)
+			} else {
+				closeRecord := ResourceRecord{
+					Timestamp:  time.Now().UTC(),
+					ClusterID:  r.ClusterID,
+					EventType:  "Deleted",
+					APIGroup:   r.GVK.Group,
+					APIVersion: r.GVK.Version,
+					Kind:       r.GVK.Kind,
+					Namespace:  req.Namespace,
+					Name:       req.Name,
+					UID:        cachedEntry.UID,
+					Data:       `{"status": "deleted"}`,
+					SHA256:     "DELETED",
+				}
+				oldUID := cachedEntry.UID
 
-			// 1. Закрываем историю старого объекта (async, best-effort logged on failure)
-			enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
-				query: insertResourceStateQuery,
-				args:  closeRecord.insertArgs(),
-				commit: func(ok bool) {
-					if !ok {
-						log.Error(errAsyncWriteFailed, "🧟 Failed to close out reincarnated object's history", "kind", r.GVK.Kind, "name", req.Name, "old_uid", oldUID)
-					}
-				},
-			})
-			if enqueueErr != nil {
-				log.Error(enqueueErr, "🧟 Failed to queue reincarnation close-out event, requeuing", "kind", r.GVK.Kind, "name", req.Name)
-				return ctrl.Result{}, enqueueErr
+				// 1. Закрываем историю старого объекта (async, best-effort logged on failure)
+				enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
+					query: insertResourceStateQuery,
+					args:  closeRecord.insertArgs(),
+					commit: func(ok bool) {
+						if !ok {
+							log.Error(errAsyncWriteFailed, "🧟 Failed to close out reincarnated object's history", "kind", r.GVK.Kind, "name", req.Name, "old_uid", oldUID)
+						}
+					},
+				})
+				if enqueueErr != nil {
+					log.Error(enqueueErr, "🧟 Failed to queue reincarnation close-out event, requeuing", "kind", r.GVK.Kind, "name", req.Name)
+					return ctrl.Result{}, enqueueErr
+				}
 			}
 
 			// 2. Текущий объект обрабатывается как чистый Added (оставляем eventType = "Added").
@@ -469,12 +517,7 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 			if err := rows.Scan(&namespace, &name, &uid, &hash); err != nil {
 				continue
 			}
-			key := gvk.Kind + "/"
-			if namespace != "" {
-				key += namespace + "/" + name
-			} else {
-				key += name
-			}
+			key := reconciler.cacheKey(namespace, name)
 
 			// StoreIfAbsent, not Store: a live Reconcile may already have
 			// reserved a newer entry for this key while SafeMode was still
@@ -544,54 +587,19 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 			continue
 		}
 
-		cacheKey := gvk.Kind + "/"
-		if reqKey.Namespace != "" {
-			cacheKey += reqKey.Namespace + "/" + reqKey.Name
-		} else {
-			cacheKey += reqKey.Name
-		}
-
-		cachedEntry, exists := reconciler.HashCache.Load(cacheKey)
-		if !exists {
-			// A live delete Reconcile already handled this object (and
-			// already wrote its own Deleted row) in the time between
-			// building targetsToCheck and getting here — nothing to do.
-			continue
-		}
-		expectedVersion := cachedEntry.Version
-
-		record := ResourceRecord{
-			Timestamp:  time.Now().UTC(),
-			ClusterID:  reconciler.ClusterID,
-			EventType:  "Deleted",
-			APIGroup:   gvk.Group,
-			APIVersion: gvk.Version,
-			Kind:       gvk.Kind,
-			Namespace:  reqKey.Namespace,
-			Name:       reqKey.Name,
-			UID:        target.UID,
-			Data:       `{"status": "deleted"}`,
-			SHA256:     "DELETED",
-		}
-
-		// Routed through CHWriter like every other write, instead of a raw
-		// conn.Exec: retried on failure, and the cache entry is only
-		// removed once the write is durably confirmed (guarded by the same
-		// version check as the live delete path, in case a live Reconcile
-		// raced ahead of this GC pass for the same key).
-		enqueueErr := reconciler.CHWriter.Enqueue(ctx, 0, writeJob{
-			query: insertResourceStateQuery,
-			args:  record.insertArgs(),
-			commit: func(ok bool) {
-				if ok {
-					reconciler.HashCache.DeleteIfCurrent(cacheKey, expectedVersion)
-					return
-				}
-				log.Error(errAsyncWriteFailed, "🧟 Zombie cleanup write failed, cache left untouched so it is retried", "kind", gvk.Kind, "name", reqKey.Name)
-			},
-		})
+		// Routed through the same claim as the live delete path
+		// (hashCache.ReserveDelete via emitDelete): if a NotFound-Reconcile
+		// already claimed this exact deletion between building
+		// targetsToCheck and getting here, claimed comes back false and
+		// there is nothing left for the GC pass to do — without this shared
+		// claim, both would independently enqueue their own "Deleted" row
+		// for the same object.
+		claimed, enqueueErr := reconciler.emitDelete(ctx, log, reqKey.Namespace, reqKey.Name)
 		if enqueueErr != nil {
 			log.Error(enqueueErr, "🧟 Failed to queue zombie cleanup event", "kind", gvk.Kind, "name", reqKey.Name)
+			continue
+		}
+		if !claimed {
 			continue
 		}
 
