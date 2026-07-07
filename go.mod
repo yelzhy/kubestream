@@ -1,4 +1,4 @@
-module github.com/yelyzavetazhy/kubestream
+module github.com/yelzhy/kubestream
 
 go 1.25.7
 

@@ -40,7 +40,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"github.com/yelyzavetazhy/kubestream/internal/controller"
+	"github.com/yelzhy/kubestream/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 

@@ -7,7 +7,7 @@ domain: kubestream.io
 layout:
 - go.kubebuilder.io/v4
 projectName: kubestream
-repo: github.com/yelyzavetazhy/kubestream
+repo: github.com/yelzhy/kubestream
 resources:
 - controller: true
   core: true
