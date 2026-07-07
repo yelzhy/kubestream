@@ -167,6 +167,8 @@ func (r *ResourceStreamReconciler) cacheKey(namespace, name string) string {
 // remove a currently-existing object's entry by name alone. Pass "" for the
 // live IsNotFound path, which has no independent belief to check and simply
 // trusts whatever the cache currently holds.
+//
+//nolint:logcheck
 func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logger, namespace, name, expectedUID string) (claimed bool, err error) {
 	objectKey := r.cacheKey(namespace, name)
 
@@ -230,6 +232,8 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 // Reconcile is requested; retryPendingCloseOuts re-attempts it on that (or
 // any later) Reconcile for this key, so a permanently-failed attempt keeps
 // getting retried instead of the historical record silently vanishing.
+//
+//nolint:logcheck
 func (r *ResourceStreamReconciler) enqueueCloseOut(ctx context.Context, log logr.Logger, objectKey string, record ResourceRecord) {
 	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
 		query: insertResourceStateQuery,
@@ -256,6 +260,8 @@ func (r *ResourceStreamReconciler) enqueueCloseOut(ctx context.Context, log logr
 // next event for this name — including the fresh Reconcile that
 // enqueueCloseOut's failure path explicitly triggers via requeue — rather
 // than only ever being attempted once.
+//
+//nolint:logcheck
 func (r *ResourceStreamReconciler) retryPendingCloseOuts(ctx context.Context, log logr.Logger, objectKey string) {
 	for _, record := range r.closeOuts.TakeAll(objectKey) {
 		r.enqueueCloseOut(ctx, log, objectKey, record)
@@ -588,7 +594,8 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 		connUsers.Add(1)
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 			defer connUsers.Done()
-			return restoreAndWarm(ctx, mgr, conn, reconciler, gvk, log)
+			restoreAndWarm(ctx, mgr, conn, reconciler, gvk, log)
+			return nil
 		})); err != nil {
 			return err
 		}
@@ -620,7 +627,9 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 // cache-miss events "Snapshot" instead of "Added" — a ClickHouse outage at
 // startup degrades to that instead of re-emitting every live object in the
 // cluster as a duplicate "Added" row.
-func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, reconciler *ResourceStreamReconciler, gvk schema.GroupVersionKind, log logr.Logger) error {
+//
+//nolint:logcheck
+func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, reconciler *ResourceStreamReconciler, gvk schema.GroupVersionKind, log logr.Logger) {
 	log.Info("🔄 Warming cache from ClickHouse history...", "kind", gvk.Kind)
 
 	type gcTarget struct {
@@ -643,7 +652,7 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		restoredCount := 0
 		for rows.Next() {
@@ -693,21 +702,21 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 		// Only reachable if ctx was cancelled (manager shutting down) before
 		// the restore ever succeeded — SafeMode simply stays on; there is no
 		// GC to run since we never got a trustworthy targetsToCheck.
-		return nil
+		return
 	}
 
 	reconciler.SafeMode.Store(false)
 	log.Info("🔓 Cache warm-up complete, leaving Snapshot mode", "kind", gvk.Kind)
 
 	if len(targetsToCheck) == 0 {
-		return nil
+		return
 	}
 
 	// ==========================================
 	// 🕵️‍♂️ Garbage Collector (with UID verification)
 	// ==========================================
 	if !mgr.GetCache().WaitForCacheSync(ctx) {
-		return nil
+		return
 	}
 
 	zombieCount := 0
@@ -765,5 +774,4 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 	if zombieCount > 0 {
 		log.Info("🧹 Garbage collector finished", "kind", gvk.Kind, "zombies_cleared", zombieCount)
 	}
-	return nil
 }

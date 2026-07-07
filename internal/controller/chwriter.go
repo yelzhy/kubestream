@@ -180,13 +180,11 @@ func (w *CHWriter) Start(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	for i := 0; i < w.workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for job := range w.jobs {
 				w.process(w.attemptContext(ctx), log, job)
 			}
-		}()
+		})
 	}
 
 	<-ctx.Done()
@@ -241,6 +239,8 @@ func (w *CHWriter) attemptContext(ctx context.Context) context.Context {
 // immediately instead of letting it run for a full insertTimeout. It always
 // reports the outcome via job.commit exactly once, only after the write is
 // truly settled.
+//
+//nolint:logcheck
 func (w *CHWriter) process(ctx context.Context, log logr.Logger, job writeJob) {
 	eb := backoff.NewExponentialBackOff()
 	eb.MaxElapsedTime = w.maxRetryBackoff

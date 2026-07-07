@@ -21,6 +21,10 @@ import (
 	"testing"
 )
 
+// newUID is reused across several tests that need a distinct UID from
+// "old-uid" to represent a reincarnated object.
+const newUID = "new-uid"
+
 func TestHashCacheReserveThenCommit(t *testing.T) {
 	var c hashCache
 
@@ -80,14 +84,14 @@ func TestHashCacheStaleDeleteDoesNotClobberNewer(t *testing.T) {
 
 	deleteVersion := c.Reserve("k", CacheEntry{UID: "old-uid"})
 	// Object recreated under a new UID before the delete's commit fires.
-	c.Reserve("k", CacheEntry{UID: "new-uid"})
+	c.Reserve("k", CacheEntry{UID: newUID})
 
 	if ok := c.DeleteIfCurrent("k", deleteVersion); ok {
 		t.Fatalf("stale DeleteIfCurrent must not apply once a newer entry exists")
 	}
 
 	entry, exists := c.Load("k")
-	if !exists || entry.UID != "new-uid" {
+	if !exists || entry.UID != newUID {
 		t.Fatalf("expected the newer incarnation's entry to survive, got %+v (exists=%v)", entry, exists)
 	}
 }
@@ -183,19 +187,19 @@ func TestHashCacheReserveDeleteRefusesUIDMismatch(t *testing.T) {
 	c.Reserve("k", CacheEntry{UID: "old-uid"})
 
 	// A live reincarnation happens before the GC pass gets to this key.
-	c.Reserve("k", CacheEntry{UID: "new-uid"})
+	c.Reserve("k", CacheEntry{UID: newUID})
 
 	if _, _, claimed := c.ReserveDelete("k", "old-uid"); claimed {
 		t.Fatalf("ReserveDelete must refuse a claim when expectedUID no longer matches the live entry")
 	}
 
 	entry, exists := c.Load("k")
-	if !exists || entry.UID != "new-uid" || entry.PendingDelete {
+	if !exists || entry.UID != newUID || entry.PendingDelete {
 		t.Fatalf("the live entry must be untouched after a refused UID-mismatched claim, got %+v (exists=%v)", entry, exists)
 	}
 
 	// The GC pass's own UID does still match when no reincarnation occurred.
-	if _, _, claimed := c.ReserveDelete("k", "new-uid"); !claimed {
+	if _, _, claimed := c.ReserveDelete("k", newUID); !claimed {
 		t.Fatalf("ReserveDelete should claim when expectedUID matches the current entry")
 	}
 }
@@ -212,12 +216,12 @@ func TestHashCacheUnclaimDeleteStaleNoop(t *testing.T) {
 		t.Fatalf("expected the claim to succeed")
 	}
 
-	c.Reserve("k", CacheEntry{UID: "new-uid"}) // reincarnation supersedes the claim
+	c.Reserve("k", CacheEntry{UID: newUID}) // reincarnation supersedes the claim
 
 	c.UnclaimDelete("k", deleteVersion)
 
 	entry, exists := c.Load("k")
-	if !exists || entry.UID != "new-uid" || entry.PendingDelete {
+	if !exists || entry.UID != newUID || entry.PendingDelete {
 		t.Fatalf("stale UnclaimDelete must not disturb the newer live entry, got %+v (exists=%v)", entry, exists)
 	}
 }
@@ -230,13 +234,11 @@ func TestHashCacheConcurrentReserveCommit(t *testing.T) {
 	const n = 200
 
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			version := c.Reserve("k", CacheEntry{Hash: "h"})
 			c.CommitIfCurrent("k", version, CacheEntry{Hash: "h-confirmed"})
-		}(i)
+		})
 	}
 	wg.Wait()
 

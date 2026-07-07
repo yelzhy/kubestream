@@ -120,7 +120,7 @@ func getEnvIntOrDefault(key string, def int) int {
 // quietly watch fewer resource types than intended.
 func parseGVKList(raw string) ([]schema.GroupVersionKind, error) {
 	var gvks []schema.GroupVersionKind
-	for _, entry := range strings.Split(raw, ",") {
+	for entry := range strings.SplitSeq(raw, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
@@ -172,7 +172,8 @@ func main() {
 	var maxConcurrentReconciles int
 	var watchedGVKsRaw string
 	flag.StringVar(&clusterID, "cluster-id", getEnvOrDefault("CLUSTER_ID", "local-kind-cluster"),
-		"Identifier for this cluster, recorded on every row written to ClickHouse. Can also be set via the CLUSTER_ID env var.")
+		"Identifier for this cluster, recorded on every row written to ClickHouse. "+
+			"Can also be set via the CLUSTER_ID env var.")
 	flag.IntVar(&maxConcurrentReconciles, "reconciler-max-concurrent", getEnvIntOrDefault("RECONCILER_MAX_CONCURRENT", 5),
 		"Maximum concurrent Reconciles per watched resource type. Can also be set via the RECONCILER_MAX_CONCURRENT env var.")
 	flag.StringVar(&watchedGVKsRaw, "watched-gvks", getEnvOrDefault("WATCHED_GVKS", defaultWatchedGVKs),
