@@ -1,121 +1,191 @@
 # kubestream
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+**Git blame for your Kubernetes cluster.** A lightweight operator that streams every Pod, Service, and Deployment state change into ClickHouse — so "what did this look like before it broke?" has an answer.
+
+## Overview & Motivation
+
+Kubernetes' own audit trail is short-lived and symptom-focused. `kubectl get events` shows you the last hour or so of what happened, native audit logs capture *API calls* rather than *resulting object state*, and once a Pod is evicted or a Deployment is rolled back, the exact spec/status that existed five minutes before the incident is gone. Incident post-mortems end up reconstructing history from a mix of memory, dashboards, and luck.
+
+`kubestream` is a Kubernetes operator (built on `controller-runtime`/`client-go`) that watches a configurable set of resource types and writes every observed state transition — `Added`, `Modified`, `Deleted` — into a ClickHouse table as an immutable, append-only row. Because it hashes and diffs each object's normalized JSON, it only writes when something actually changed, giving you a compact, queryable, retrospective timeline of cluster state instead of a live-only snapshot.
+
+It is currently scoped to core workload resources (Pods, Deployments, Services) but the watched set is a runtime configuration value, not a compiled-in list — extending it to other built-in types or CRDs is a config change (plus a matching RBAC grant), not a code change.
+
+## Use Cases
+
+- **Incident post-mortems** — "what was this Deployment's spec/status at 03:14 UTC, right before the outage started?" Query ClickHouse instead of hoping someone took a screenshot.
+- **Platform engineering** — track configuration drift across a fleet of clusters: who/what changed a resource, and what changed exactly (via the stored diff).
+- **SecOps** — an independent, operator-owned record of resource state that doesn't depend on the API server's own audit log retention window.
+- **Compliance / change auditing** — a durable, timestamped history of every workload state change, per cluster, for retrospective review.
+
+## Key Features
+
+- **Dynamic resource watching** — the set of watched GVKs is driven entirely by the `WATCHED_GVKS` env var / `--watched-gvks` flag (`"version/kind"` or `"group/version/kind"`, comma-separated). Defaults to `v1/Pod,apps/v1/Deployment,v1/Service`. Adding a new type (including a CRD) is a config change; it still requires a matching RBAC grant in `config/rbac/role.yaml`.
+- **Asynchronous, non-blocking ClickHouse writes** — every insert is handed off to `CHWriter`, a bounded-queue worker pool with exponential-backoff retries (`backoff/v4`). `Reconcile` never calls ClickHouse synchronously and returns as soon as a job is enqueued, so a slow or unavailable database never stalls the reconcile loop or the informer.
+- **Hash-based deduplication** — every object's normalized JSON (with `managedFields`, `resourceVersion`, and `generation` stripped) is SHA-256 hashed; an unchanged hash short-circuits as a no-op, so only genuine state changes reach ClickHouse.
+- **Graceful JSON diffing** — `Modified` events store a computed JSON patch (`wI2L/jsondiff`) instead of the full object where possible, falling back to the full state whenever a prior baseline is missing or the diff/marshal step itself fails, rather than dropping the row.
+- **Version-gated cache, not a naive map** — the in-memory dedup cache (`hashCache`) assigns a monotonic version per key on every write attempt; a commit or delete only applies if its version is still current, so an out-of-order async write can never clobber a newer one.
+- **Duplicate-write-safe delete handling** — the live delete path, the reincarnation (delete-then-recreate) close-out path, and the startup zombie-GC pass all claim through the same `ReserveDelete` primitive (with UID verification), so the same disappearance can never produce two `Deleted` rows.
+- **Robust zombie-resource garbage collection** — on startup, a background pass compares ClickHouse's last-known state per object against the live (cache-backed) cluster and emits a `Deleted` row for anything that vanished (or was recreated under a new UID) while the operator was down.
+- **Crash/restart resilient, non-blocking startup** — cache warm-up and GC run as a `manager.Runnable` in the background; `mgr.Start()` is never gated on ClickHouse being reachable. While the cache is still warming, cache-miss events are tagged `Snapshot` instead of `Added`, so a slow ClickHouse at boot degrades gracefully instead of re-emitting the whole cluster as a flood of duplicate `Added` rows.
+- **Self-healing on write failure** — a terminally-failed async write reverts its optimistic cache entry and explicitly triggers a fresh `Reconcile` (via an internal event channel), rather than silently vanishing until an unrelated future change happens to touch the same object.
+- **No hardcoded configuration** — ClickHouse address/credentials/timeouts, the cluster identifier, concurrency, and the watched GVK list are all sourced from flags/environment variables; `CH_PASSWORD` is environment-only (never a flag) so it never shows up in a process listing.
+
+## Architecture Overview
+
+```
+Informer cache (per watched GVK)
+        │  (Added/Modified/Deleted events)
+        ▼
+  Reconcile()
+    ├─ normalize object JSON (strip managedFields/resourceVersion/generation)
+    ├─ SHA-256 hash + compare against hashCache (versioned, in-memory)
+    ├─ unchanged?  → no-op, return
+    ├─ changed?    → compute JSON diff (or full state on cache-miss/diff failure)
+    └─ Reserve() a pending cache version, then CHWriter.Enqueue(job)
+                       │ (non-blocking, bounded channel)
+                       ▼
+              CHWriter worker pool
+                (backoff/v4 retries per job)
+                       │
+                       ▼
+              ClickHouse INSERT
+                       │
+          success ─────┴───── failure
+            │                    │
+   CommitIfCurrent()      revert cache + re-trigger Reconcile
+   (settle the version)   (UnclaimDelete/requeue)
+```
+
+- **Informer caches, not live API calls**: all reads (`Get`, and the GC pass's existence check) go through the manager's shared, cache-backed client — nothing in the hot path issues a direct, uncached API request.
+- **One `CHWriter` per manager, shared across every watched GVK**: registered as a `manager.Runnable`, its own lifecycle (start workers → drain the queue on shutdown → close the ClickHouse connection) is tied to the manager's.
+- **One `hashCache` per GVK**: a mutex-protected map from `"<Kind>/<namespace>/<name>"` to a versioned `CacheEntry` (hash, normalized JSON, UID, version, pending-delete flag). All commits/deletes are gated on the version issued when the corresponding write was reserved.
+- **Startup warm-up + GC**: for each watched GVK, a `restoreAndWarm` goroutine queries ClickHouse for the latest known state of every object, seeds the cache (without clobbering anything a live `Reconcile` already wrote), then diffs that snapshot against the live cluster to detect and close out "zombie" objects that disappeared while the operator was offline.
+- **ClickHouse schema is not shipped in this repository** — you must create the target table yourself before deploying (see [ClickHouse schema](#clickhouse-schema) below).
+
+### ClickHouse schema
+
+`kubestream` writes to (and reads history from) a single table named `resource_states`, using this exact query shape (from `internal/controller/chwriter.go`):
+
+```sql
+INSERT INTO resource_states (
+    ts, cluster_id, event_type, api_group, api_version, kind, namespace, name,
+    uid, resource_version, labels, data, diff_data, sha256
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+```
+
+No DDL/migration is included in this repo — you are responsible for creating a compatible table. A minimal example that matches the columns and types the writer sends:
+
+```sql
+CREATE TABLE resource_states
+(
+    ts               DateTime64(9),
+    cluster_id       String,
+    event_type       LowCardinality(String), -- Added | Modified | Deleted | Snapshot
+    api_group        String,
+    api_version      String,
+    kind             String,
+    namespace        String,
+    name             String,
+    uid              String,
+    resource_version String,
+    labels           Map(String, String),
+    data             String,
+    diff_data        String,
+    sha256           String
+)
+ENGINE = MergeTree
+ORDER BY (kind, namespace, name, ts);
+```
+
+Tune the engine/ordering/partitioning to your own retention and query patterns — the operator only depends on the column list above, plus being able to run `SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts) FROM resource_states WHERE kind = ? AND cluster_id = ? GROUP BY namespace, name HAVING argMax(event_type, ts) != 'Deleted'` for its startup warm-up/GC pass.
+
+## Configuration
+
+Every setting is available as both a CLI flag and an environment variable (flag wins if both are set), except `CH_PASSWORD`, which is environment-only.
+
+| Flag | Env Var | Default | Description |
+|---|---|---|---|
+| `--ch-addr` | `CH_ADDR` | `127.0.0.1:9000` | ClickHouse server address (`host:port`, native protocol). |
+| `--ch-database` | `CH_DATABASE` | `kubestream` | ClickHouse database name. |
+| `--ch-username` | `CH_USERNAME` | `default` | ClickHouse username. |
+| — | `CH_PASSWORD` | *(empty)* | ClickHouse password. Env-only by design — flag values are visible in `ps`; connects passwordless if unset (logged as a warning). |
+| `--ch-dial-timeout` | `CH_DIAL_TIMEOUT` | `5s` | Timeout for establishing the ClickHouse connection. |
+| `--ch-read-timeout` | `CH_READ_TIMEOUT` | `10s` | Timeout for a single ClickHouse query/insert round-trip; also governs the async writer's per-attempt insert timeout. |
+| `--cluster-id` | `CLUSTER_ID` | `local-kind-cluster` | Identifier for this cluster, recorded on every row. |
+| `--reconciler-max-concurrent` | `RECONCILER_MAX_CONCURRENT` | `5` | Max concurrent `Reconcile` calls per watched resource type. |
+| `--watched-gvks` | `WATCHED_GVKS` | `v1/Pod,apps/v1/Deployment,v1/Service` | Comma-separated list of resource types to watch, as `version/kind` or `group/version/kind`. Adding a type outside the default RBAC grant requires extending `config/rbac/role.yaml`. |
+| `--metrics-bind-address` | — | `0` (disabled) | Metrics endpoint bind address; `:8443` for HTTPS, `:8080` for HTTP. |
+| `--metrics-secure` | — | `true` | Serve the metrics endpoint over HTTPS. |
+| `--health-probe-bind-address` | — | `:8081` | Health/readiness probe bind address. |
+| `--leader-elect` | — | `false` | Enable leader election (for multi-replica deployments). |
+| `--webhook-cert-path` / `--webhook-cert-name` / `--webhook-cert-key` | — | *(empty)* / `tls.crt` / `tls.key` | Webhook server TLS certificate (unused today — no webhooks are registered — reserved for future use). |
+| `--metrics-cert-path` / `--metrics-cert-name` / `--metrics-cert-key` | — | *(empty)* / `tls.crt` / `tls.key` | Metrics server TLS certificate. |
+| `--enable-http2` | — | `false` | Enable HTTP/2 on the metrics/webhook servers (disabled by default due to known CVEs). |
+
+`CHWriter`'s queue size, worker count, per-attempt retry backoff cap, and shutdown drain timeout currently default internally (queue: 5000 jobs, workers: 4, max retry backoff: 60s, shutdown drain: 15s) and are not yet exposed as flags/env vars.
+
+Standard `controller-runtime`/Zap logging flags (`--zap-devel`, `--zap-encoder`, `--zap-log-level`, `--zap-stacktrace-level`, `--zap-time-encoding`) are also available; run the binary with `--help` for the full, exact list.
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+- Go v1.25+ (see `go.mod`)
+- Docker (or another `CONTAINER_TOOL`) for building the operator image
+- `kubectl`, and access to a Kubernetes cluster
+- A reachable ClickHouse instance, with the `resource_states` table already created (see [ClickHouse schema](#clickhouse-schema))
 
-```sh
-make docker-build docker-push IMG=<some-registry>/kubestream:tag
-```
+This project does not define a CRD — there is nothing to `make install` beyond the operator itself; it only watches existing built-in resource types (or others you configure via `WATCHED_GVKS`).
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+### Deploying to a cluster
 
-**Install the CRDs into the cluster:**
+1. **Build and push the operator image:**
 
-```sh
-make install
-```
+   ```sh
+   make docker-build docker-push IMG=<some-registry>/kubestream:tag
+   ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+2. **Set the real ClickHouse password.** `config/manager/clickhouse-secret.yaml` ships with a `changeme` placeholder — replace it before applying, e.g.:
 
-```sh
-make deploy IMG=<some-registry>/kubestream:tag
-```
+   ```sh
+   kubectl create secret generic clickhouse-credentials \
+     --namespace kubestream-system \
+     --from-literal=password='<your-password>' \
+     --dry-run=client -o yaml | kubectl apply -f -
+   ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+   (For a real deployment, prefer a Kustomize `SecretGenerator` overlay or a secret-management tool — Sealed Secrets, External Secrets, SOPS — over committing a plaintext value.)
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+3. **Point the deployment at your ClickHouse instance and cluster identifier.** Edit the `env` block in `config/manager/manager.yaml` (`CH_ADDR`, `CH_DATABASE`, `CH_USERNAME`, `CLUSTER_ID`, etc.) — the checked-in values are local/dev placeholders.
 
-```sh
-kubectl apply -k config/samples/
-```
+4. **Deploy:**
 
->**NOTE**: Ensure that the samples has default values to test it out.
+   ```sh
+   make deploy IMG=<some-registry>/kubestream:tag
+   ```
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
+### Uninstalling
 
 ```sh
 make undeploy
 ```
 
-## Project Distribution
+## Local Development
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+This project is scaffolded with [Kubebuilder](https://book.kubebuilder.io/) and uses its standard Makefile targets:
 
 ```sh
-make build-installer IMG=<some-registry>/kubestream:tag
+make build          # go build the manager binary
+make run            # run the controller locally against your current kubeconfig context
+make test           # run the unit/envtest suite (requires the envtest/etcd binaries; make setup-envtest fetches them)
+make lint           # run golangci-lint (see .golangci.yml for the enabled linters)
+make lint-fix       # run golangci-lint with --fix
+make fmt vet        # gofmt + go vet
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+`make test` runs both the pure-Go unit tests (e.g. `internal/controller/hashcache_test.go`, `cmd/main_test.go`) and the Ginkgo/envtest-based suite in `internal/controller/suite_test.go`, which spins up a real (test-only) API server via `envtest` — no live cluster is required for it, but the envtest binaries must be present locally (`make setup-envtest`).
 
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/kubestream/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+Run `make help` for the full list of available targets (image building, Kustomize install/deploy, dependency downloads, etc.).
 
 ## License
 
@@ -132,4 +202,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
