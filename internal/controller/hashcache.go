@@ -43,6 +43,16 @@ type hashCache struct {
 	data map[string]CacheEntry
 }
 
+// Len returns the current number of entries. It exists so callers can feed the
+// hashcache_entries metric without any metric call ever happening while the
+// mutex is held: Len takes and releases the lock itself, and the caller does
+// the gauge Set on the returned value afterwards (see recordHashCacheEntries).
+func (c *hashCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.data)
+}
+
 // Load returns the current entry for key, if any.
 func (c *hashCache) Load(key string) (CacheEntry, bool) {
 	c.mu.Lock()

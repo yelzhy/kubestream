@@ -80,6 +80,10 @@ type ResourceStreamReconciler struct {
 	// nowhere in HashCache to durably remember "the old UID's close-out still
 	// needs to happen" without a newer write clobbering it.
 	closeOuts closeOutRetryQueue
+
+	// metrics records dedup short-circuits, hashCache size, per-kind SafeMode,
+	// and dropped requeue triggers. Never nil once set in SetupWithManager.
+	metrics *pipelineMetrics
 }
 
 // closeOutRetryQueue is a mutex-protected map from cacheKey to the
@@ -130,8 +134,17 @@ func (r *ResourceStreamReconciler) requeue(namespace, name string) {
 	select {
 	case r.requeueCh <- event.GenericEvent{Object: obj}:
 	default:
+		r.metrics.requeueDrops.Inc()
 		logf.Log.WithName("chwriter").Info("requeue channel full, dropping re-reconcile trigger", "kind", r.GVK.Kind, "namespace", namespace, "name", name)
 	}
+}
+
+// recordHashCacheEntries publishes the current per-kind hashCache size to the
+// hashcache_entries gauge. Len() takes and releases the cache's own lock, and
+// the gauge Set happens here, strictly outside it — no metric call ever runs
+// while a hashCache lock is held (a Task 0.1 acceptance criterion).
+func (r *ResourceStreamReconciler) recordHashCacheEntries() {
+	r.metrics.hashcacheEntries.WithLabelValues(r.GVK.Kind).Set(float64(r.HashCache.Len()))
 }
 
 // cacheKey builds the hashCache key for a namespace/name pair under this
@@ -206,6 +219,7 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 		commit: func(ok bool) {
 			if ok {
 				r.HashCache.DeleteIfCurrent(objectKey, version)
+				r.recordHashCacheEntries()
 				return
 			}
 			log.Error(errAsyncWriteFailed, "🗑️ Deletion write failed, releasing claim so it is retried", "kind", r.GVK.Kind, "namespace", namespace, "name", name)
@@ -395,6 +409,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		} else {
 			// Ordinary logic (same object)
 			if cachedEntry.Hash == hashString {
+				r.metrics.dedupSkips.Inc()
 				return ctrl.Result{}, nil // Duplicate
 			}
 
@@ -461,6 +476,9 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		JSON: objJson,
 		UID:  currentUID,
 	})
+	// Reserve may have added a brand-new key; refresh the size gauge outside
+	// any cache lock (recordHashCacheEntries takes/releases it internally).
+	r.recordHashCacheEntries()
 
 	revertVersion := func() {
 		if revertEntry != nil {
@@ -586,10 +604,12 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 			GVK:       gvk,
 			ClusterID: reconcilerConfig.ClusterID,
 			requeueCh: requeueCh,
+			metrics:   pipelineMetricsInstance(),
 		}
 		// The cache starts empty and isn't trustworthy until restoreAndWarm
 		// (below) finishes — see the SafeMode field doc and Reconcile.
 		reconciler.SafeMode.Store(true)
+		reconciler.metrics.safeMode.WithLabelValues(gvk.Kind).Set(1)
 
 		connUsers.Add(1)
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
@@ -706,6 +726,7 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 	}
 
 	reconciler.SafeMode.Store(false)
+	reconciler.metrics.safeMode.WithLabelValues(gvk.Kind).Set(0)
 	log.Info("🔓 Cache warm-up complete, leaving Snapshot mode", "kind", gvk.Kind)
 
 	if len(targetsToCheck) == 0 {

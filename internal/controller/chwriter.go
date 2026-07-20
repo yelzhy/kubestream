@@ -87,6 +87,11 @@ type CHWriter struct {
 	// CHWriter (namely restoreAndWarm) that also use the shared connection.
 	// See WaitForOthers.
 	otherUsers *sync.WaitGroup
+
+	// metrics records queue depth/capacity, enqueue blocking and timeouts, and
+	// per-job write latency, retries, and outcomes. Never nil once built via
+	// NewCHWriter; tests may swap in an isolated instance before Start.
+	metrics *pipelineMetrics
 }
 
 // NewCHWriter builds a CHWriter around an existing ClickHouse connection.
@@ -115,6 +120,7 @@ func NewCHWriter(conn driver.Conn, queueSize, workers int, insertTimeout, maxRet
 		maxRetryBackoff:      maxRetryBackoff,
 		shutdownDrainTimeout: shutdownDrainTimeout,
 		drainCtx:             context.Background(),
+		metrics:              pipelineMetricsInstance(),
 	}
 }
 
@@ -150,12 +156,21 @@ func (w *CHWriter) Enqueue(ctx context.Context, enqueueTimeout time.Duration, jo
 	timer := time.NewTimer(enqueueTimeout)
 	defer timer.Stop()
 
+	// enqueue_block_seconds measures how long the hot path actually waited for
+	// room, whether the send eventually succeeded or timed out — the direct
+	// backpressure signal a reconciler feels.
+	start := time.Now()
 	select {
 	case w.jobs <- job:
+		w.metrics.enqueueBlock.Observe(time.Since(start).Seconds())
+		w.metrics.writeQueueDepth.Set(float64(len(w.jobs)))
 		return nil
 	case <-ctx.Done():
+		w.metrics.enqueueBlock.Observe(time.Since(start).Seconds())
 		return ctx.Err()
 	case <-timer.C:
+		w.metrics.enqueueBlock.Observe(time.Since(start).Seconds())
+		w.metrics.enqueueTimeouts.Inc()
 		return fmt.Errorf("chwriter: write queue still full after waiting %s", enqueueTimeout)
 	}
 }
@@ -177,6 +192,10 @@ func (w *CHWriter) Enqueue(ctx context.Context, enqueueTimeout time.Duration, jo
 //  6. Close conn — guaranteed safe now, since nothing can still be using it.
 func (w *CHWriter) Start(ctx context.Context) error {
 	log := logf.Log.WithName("chwriter")
+
+	// Capacity is fixed for this CHWriter's lifetime; publishing it here (once
+	// the queue exists) lets dashboards express depth as a fraction of it.
+	w.metrics.writeQueueCapacity.Set(float64(cap(w.jobs)))
 
 	var wg sync.WaitGroup
 	for i := 0; i < w.workers; i++ {
@@ -242,17 +261,35 @@ func (w *CHWriter) attemptContext(ctx context.Context) context.Context {
 //
 //nolint:logcheck
 func (w *CHWriter) process(ctx context.Context, log logr.Logger, job writeJob) {
+	// A job leaves the queue the moment we pull it, so refresh depth here too —
+	// not only on enqueue — so a draining queue is reflected, not just a
+	// filling one.
+	w.metrics.writeQueueDepth.Set(float64(len(w.jobs)))
+
 	eb := backoff.NewExponentialBackOff()
 	eb.MaxElapsedTime = w.maxRetryBackoff
 
+	start := time.Now()
+	attempts := 0
 	err := backoff.Retry(func() error {
+		// Every attempt after the first is a retry; counting them here (rather
+		// than the successes) is what makes a retry storm visible even when the
+		// writes ultimately succeed.
+		if attempts > 0 {
+			w.metrics.writeRetryAttempts.Inc()
+		}
+		attempts++
 		writeCtx, cancel := context.WithTimeout(ctx, w.insertTimeout)
 		defer cancel()
 		return w.conn.Exec(writeCtx, job.query, job.args...)
 	}, backoff.WithContext(eb, ctx))
 
+	w.metrics.writeLatency.Observe(time.Since(start).Seconds())
 	if err != nil {
+		w.metrics.writesTotal.WithLabelValues("failed").Inc()
 		log.Error(err, "chwriter: giving up on write after exhausting retries")
+	} else {
+		w.metrics.writesTotal.WithLabelValues("success").Inc()
 	}
 	if job.commit != nil {
 		job.commit(err == nil)

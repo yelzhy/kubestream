@@ -126,6 +126,24 @@ Every setting is available as both a CLI flag and an environment variable (flag 
 
 Standard `controller-runtime`/Zap logging flags (`--zap-devel`, `--zap-encoder`, `--zap-log-level`, `--zap-stacktrace-level`, `--zap-time-encoding`) are also available; run the binary with `--help` for the full, exact list.
 
+## Metrics
+
+kubestream registers the following pipeline metrics on controller-runtime's global Prometheus registry, so they are served by the existing metrics endpoint (`--metrics-bind-address`). All names are prefixed `kubestream_`.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `kubestream_write_queue_depth` | Gauge | — | Jobs currently buffered in the `CHWriter` hand-off queue. |
+| `kubestream_write_queue_capacity` | Gauge | — | Maximum jobs the hand-off queue can buffer. |
+| `kubestream_writes_total` | Counter | `outcome="success"\|"failed"` | Settled ClickHouse write jobs, by outcome. |
+| `kubestream_write_latency_seconds` | Histogram | — | Time from a job's first write attempt to its final settle (incl. retries). |
+| `kubestream_write_retry_attempts_total` | Counter | — | Write attempts beyond the first (i.e. retries), across all jobs. |
+| `kubestream_enqueue_block_seconds` | Histogram | — | Time `Enqueue` spent blocked waiting for queue room. |
+| `kubestream_enqueue_timeouts_total` | Counter | — | `Enqueue` calls that gave up because the queue stayed full past the timeout. |
+| `kubestream_dedup_skips_total` | Counter | — | Reconciles short-circuited because the object's hash was unchanged. |
+| `kubestream_hashcache_entries` | Gauge | `kind` | Live `hashCache` entries, per kind. |
+| `kubestream_safe_mode` | Gauge (0/1) | `kind` | `1` while a kind's cache is still warming (Snapshot mode), `0` once warm. |
+| `kubestream_requeue_drops_total` | Counter | — | Re-reconcile triggers dropped because the requeue channel was full. |
+
 ## Getting Started
 
 ### Prerequisites
