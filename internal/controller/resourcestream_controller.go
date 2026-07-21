@@ -148,16 +148,29 @@ func (r *ResourceStreamReconciler) recordHashCacheEntries() {
 }
 
 // cacheKey builds the hashCache key for a namespace/name pair under this
-// reconciler's GVK. The single canonical builder, used by Reconcile,
-// emitDelete, and restoreAndWarm, so a cache entry written under one code
-// path is always found by the others — namespaced and cluster-scoped names
-// alike (client.ObjectKey.String() always renders as "namespace/name", even
-// when namespace is empty, which req.NamespacedName.String() already relies
-// on; hand-rolling this per call site previously let it drift, harmlessly
-// today since every watched GVK is namespaced, but silently, had a
-// cluster-scoped GVK ever been added).
+// reconciler's GVK. It is the single canonical identity-key builder in the
+// codebase (Invariant 7); every consumer — Reconcile, emitDelete,
+// restoreAndWarm, and the closeOuts reincarnation branch — routes through it,
+// so a cache entry written under one code path is always found by the others,
+// and no other call site concatenates a key by hand.
+//
+// Invariant 7 (verbatim): An object's identity is
+// (cluster_id, api_group, kind, namespace, name) — version-agnostic (apps/v1
+// and a hypothetical apps/v2 Deployment are the same object). Exactly one
+// function in the codebase constructs this key. cluster_id is explicit in the
+// schema but implicit in-process (one operator instance serves one cluster):
+// in-memory cache/queue keys are (api_group, kind, namespace, name) — do not
+// thread cluster_id through them.
+//
+// Hence the key embeds Group and Kind but never Version: batch/v1 Job and a
+// CRD example.com/v1 Job are distinct resources and must not share a cache
+// entry (the GVK-collision bug this builder fixes), while apps/v1 and apps/v2
+// of the same resource must share one. The "|" delimiters keep Group, Kind,
+// and the ObjectKey unambiguous; ObjectKey.String() always renders as
+// "namespace/name" even when namespace is empty, so namespaced and
+// cluster-scoped names key identically.
 func (r *ResourceStreamReconciler) cacheKey(namespace, name string) string {
-	return r.GVK.Kind + "/" + (client.ObjectKey{Namespace: namespace, Name: name}).String()
+	return r.GVK.Group + "|" + r.GVK.Kind + "|" + (client.ObjectKey{Namespace: namespace, Name: name}).String()
 }
 
 // emitDelete is the single place a "Deleted" row is ever enqueued. Both the
@@ -691,9 +704,9 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 		// Filtering on api_group as well as kind keeps two different resources
 		// that share a Kind (e.g. batch/v1 Job vs. a CRD example.com/v1 Job)
 		// from cross-contaminating each other's warm-up history — the schema-v1
-		// identity is (cluster_id, api_group, kind, namespace, name). The full
-		// in-process identity-key builder lands in Task 0.4; this query only
-		// needs the api_group discriminator now that the column is first-class.
+		// identity is (cluster_id, api_group, kind, namespace, name). This is
+		// the ClickHouse-side mirror of the in-process cacheKey builder, which
+		// keys on (api_group, kind, namespace, name) for the same reason.
 		rows, err := conn.Query(ctx, `
             SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts)
             FROM resource_states

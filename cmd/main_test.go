@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -95,5 +96,53 @@ func TestParseGVKListRejectsEmptyVersionOrKind(t *testing.T) {
 		if _, err := parseGVKList(raw); err == nil {
 			t.Fatalf("expected an error for entry with empty version/kind %q, got none", raw)
 		}
+	}
+}
+
+func TestParseGVKListRejectsDuplicateGroupKind(t *testing.T) {
+	// Same (group, kind), differing versions: the identity key is
+	// version-agnostic (Invariant 7), so this would watch one resource twice.
+	cases := []struct {
+		name         string
+		raw          string
+		wantMentions []string
+	}{
+		{
+			name:         "non-core group",
+			raw:          "apps/v1/Deployment,apps/v2/Deployment",
+			wantMentions: []string{"apps/v1/Deployment", "apps/v2/Deployment"},
+		},
+		{
+			// A core-group entry ("v1/Job", group "") and a group-qualified
+			// entry for the same core kind still collide on (group, kind).
+			name:         "core group two-segment vs three-segment",
+			raw:          "v1/Endpoints,/v2/Endpoints",
+			wantMentions: []string{"v1/Endpoints", "/v2/Endpoints"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseGVKList(tc.raw)
+			if err == nil {
+				t.Fatalf("expected a duplicate (group, kind) error for %q, got none", tc.raw)
+			}
+			for _, m := range tc.wantMentions {
+				if !strings.Contains(err.Error(), m) {
+					t.Fatalf("error %q does not name offending entry %q", err.Error(), m)
+				}
+			}
+		})
+	}
+}
+
+func TestParseGVKListAllowsSameGroupDifferentKinds(t *testing.T) {
+	// Same group, different kinds must still parse: the duplicate check keys on
+	// (group, kind), not group alone.
+	gvks, err := parseGVKList("apps/v1/Deployment,apps/v1/StatefulSet")
+	if err != nil {
+		t.Fatalf("unexpected error for distinct kinds in one group: %v", err)
+	}
+	if len(gvks) != 2 {
+		t.Fatalf("expected 2 GVKs, got %+v", gvks)
 	}
 }

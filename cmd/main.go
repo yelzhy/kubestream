@@ -134,8 +134,18 @@ func getEnvBoolOrDefault(key string, def bool) bool {
 // Returns an error naming the malformed entry on invalid input, rather than
 // silently skipping it — a typo here should fail startup loudly, not
 // quietly watch fewer resource types than intended.
+//
+// It also rejects two entries with the same (group, kind) but different
+// versions: the operator's identity key is version-agnostic (Invariant 7, see
+// ResourceStreamReconciler.cacheKey), so watching e.g. both apps/v1/Deployment
+// and apps/v2/Deployment would spin up two reconcilers writing to a single
+// shared cache entry per object — an out-of-order-commit and duplicate-write
+// hazard. Naming both offending entries makes the misconfiguration obvious.
 func parseGVKList(raw string) ([]schema.GroupVersionKind, error) {
 	var gvks []schema.GroupVersionKind
+	// seenGroupKind maps a (group, kind) pair to the raw entry that first
+	// claimed it, so a later collision can name both entries in its error.
+	seenGroupKind := make(map[schema.GroupKind]string)
 	for entry := range strings.SplitSeq(raw, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
@@ -154,6 +164,15 @@ func parseGVKList(raw string) ([]schema.GroupVersionKind, error) {
 		if gvk.Version == "" || gvk.Kind == "" {
 			return nil, fmt.Errorf("invalid GVK %q: version and kind must not be empty", entry)
 		}
+
+		gk := gvk.GroupKind()
+		if prior, dup := seenGroupKind[gk]; dup {
+			return nil, fmt.Errorf(
+				"duplicate (group, kind) in WATCHED_GVKS: %q and %q watch the same resource (identity is version-agnostic)",
+				prior, entry)
+		}
+		seenGroupKind[gk] = entry
+
 		gvks = append(gvks, gvk)
 	}
 	return gvks, nil
