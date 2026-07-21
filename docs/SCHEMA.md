@@ -45,7 +45,7 @@ One row per observed state transition of a watched object.
 | `uid` | `String` | Kubernetes UID of the object incarnation. Distinguishes a delete-and-recreate of the same name (a "reincarnation") from a plain update. |
 | `resource_version` | `String` | The object's `metadata.resourceVersion` at observation time. |
 | `labels` | `Map(LowCardinality(String), String)` | The object's labels at observation time. |
-| `actors` | `Array(LowCardinality(String))` | Field-manager names harvested from `metadata.managedFields` — the cheapest "who probably changed this" signal. Populated by Task 0.3; **empty (`[]`) in schema v1 as shipped by Task 0.2**, and always empty on `Deleted` rows (no live object to inspect). |
+| `actors` | `Array(LowCardinality(String))` | Field-manager names harvested from `metadata.managedFields` — the cheapest "who probably changed this" signal. De-duplicated and sorted; empty manager names are recorded as `unknown`. **Always empty (`[]`) on `Deleted` rows** — there is no live object left to inspect, so a deletion's authorship is intentionally not attributed. |
 | `data` | `String` (`ZSTD(3)`) | Full normalized JSON of the object. Populated on `Added`, `Snapshot`, and `Checkpoint`; **empty** otherwise. |
 | `diff` | `String` (`ZSTD(3)`) | RFC 6902 JSON Patch describing the change. Populated on `Modified` (and `Checkpoint`); **empty** otherwise. See [Diff format](#diff-format). |
 | `sha256` | `String` | Hex SHA-256 of the normalized JSON, used for dedup/version-gating. **Empty on `Deleted`.** |

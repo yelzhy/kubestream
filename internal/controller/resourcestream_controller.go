@@ -326,6 +326,11 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		labels = make(map[string]string)
 	}
 
+	// Harvest field-manager names before managedFields is stripped below —
+	// this is the only chance to read them, and extractActors only reads, so
+	// the normalization + hashing that follows is byte-for-byte unaffected.
+	actors := extractActors(obj)
+
 	unstructured.RemoveNestedField(obj.Object, "metadata", "managedFields")
 	unstructured.RemoveNestedField(obj.Object, "metadata", "resourceVersion")
 	unstructured.RemoveNestedField(obj.Object, "metadata", "generation")
@@ -501,6 +506,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		UID:             currentUID,
 		ResourceVersion: originalRV,
 		Labels:          labels,
+		Actors:          actors,
 		Data:            dataString,
 		Diff:            diffString,
 		SHA256:          hashString,
