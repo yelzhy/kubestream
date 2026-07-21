@@ -106,6 +106,22 @@ func getEnvIntOrDefault(key string, def int) int {
 	return n
 }
 
+// getEnvBoolOrDefault is getEnvOrDefault for bool flags. An unparsable value
+// falls back to def rather than failing startup. See getEnvDurationOrDefault
+// for why this logs via stderr rather than setupLog.
+func getEnvBoolOrDefault(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kubestream: invalid boolean %q for env var %s, using default %t: %v\n", v, key, def, err)
+		return def
+	}
+	return b
+}
+
 // parseGVKList parses a comma-separated list of GroupVersionKinds, each
 // given as "version/kind" (core group, e.g. "v1/Pod") or
 // "group/version/kind" (e.g. "apps/v1/Deployment",
@@ -155,6 +171,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var chAddr, chDatabase, chUsername string
 	var chDialTimeout, chReadTimeout time.Duration
+	var chAutoCreateSchema bool
 	flag.StringVar(&chAddr, "ch-addr", getEnvOrDefault("CH_ADDR", "127.0.0.1:9000"),
 		"The ClickHouse server address (host:port). Can also be set via the CH_ADDR env var.")
 	flag.StringVar(&chDatabase, "ch-database", getEnvOrDefault("CH_DATABASE", "kubestream"),
@@ -165,6 +182,9 @@ func main() {
 		"Timeout for establishing the ClickHouse connection. Can also be set via the CH_DIAL_TIMEOUT env var.")
 	flag.DurationVar(&chReadTimeout, "ch-read-timeout", getEnvDurationOrDefault("CH_READ_TIMEOUT", 10*time.Second),
 		"Timeout for a single ClickHouse query/insert round-trip. Can also be set via the CH_READ_TIMEOUT env var.")
+	flag.BoolVar(&chAutoCreateSchema, "ch-auto-create-schema", getEnvBoolOrDefault("CH_AUTO_CREATE_SCHEMA", false),
+		"If set, execute the shipped ClickHouse DDL (deploy/clickhouse/schema) idempotently at connect time. "+
+			"Defaults to false. Can also be set via the CH_AUTO_CREATE_SCHEMA env var.")
 	// CH_PASSWORD is intentionally env-only (no flag): flag values are
 	// visible in `ps`/process listings, which a Secret-projected env var
 	// avoids.
@@ -298,12 +318,13 @@ func main() {
 	}
 
 	chConfig := controller.ClickHouseConfig{
-		Addr:        chAddr,
-		Database:    chDatabase,
-		Username:    chUsername,
-		Password:    os.Getenv("CH_PASSWORD"),
-		DialTimeout: chDialTimeout,
-		ReadTimeout: chReadTimeout,
+		Addr:             chAddr,
+		Database:         chDatabase,
+		Username:         chUsername,
+		Password:         os.Getenv("CH_PASSWORD"),
+		DialTimeout:      chDialTimeout,
+		ReadTimeout:      chReadTimeout,
+		AutoCreateSchema: chAutoCreateSchema,
 	}
 	if chConfig.Password == "" {
 		setupLog.Info("CH_PASSWORD is not set; connecting to ClickHouse without a password")

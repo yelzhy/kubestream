@@ -40,8 +40,8 @@ const (
 
 	insertResourceStateQuery = `
         INSERT INTO resource_states (
-            ts, cluster_id, event_type, api_group, api_version, kind, namespace, name, uid, resource_version, labels, data, diff_data, sha256
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ts, cluster_id, event_type, api_group, api_version, kind, namespace, name, uid, resource_version, labels, actors, data, diff, sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 )
 
 // writeJob is a single ClickHouse insert submitted by a Reconcile call.

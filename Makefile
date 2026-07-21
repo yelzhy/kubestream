@@ -63,6 +63,41 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+# Integration tests run against a real, dockerized ClickHouse (build tag
+# `integration`). The target boots a throwaway container, waits for it to
+# accept queries, runs the tagged tests, and always tears the container down.
+# Non-standard host ports so this never collides with a developer's local
+# ClickHouse bound to the usual 9000/8123. The image's default user is
+# localhost-only; CLICKHOUSE_USER/PASSWORD create an any-network user the host
+# test can actually authenticate as through the port mapping.
+CH_IT_IMAGE ?= clickhouse/clickhouse-server:24.8
+CH_IT_CONTAINER ?= kubestream-it-clickhouse
+CH_IT_ADDR ?= 127.0.0.1:19000
+CH_IT_USER ?= kubestream
+CH_IT_PASSWORD ?= kubestream
+
+.PHONY: test-integration
+test-integration: ## Run integration tests against a dockerized ClickHouse.
+	@echo "Starting ClickHouse container '$(CH_IT_CONTAINER)'..."
+	@$(CONTAINER_TOOL) rm -f $(CH_IT_CONTAINER) >/dev/null 2>&1 || true
+	@$(CONTAINER_TOOL) run -d --name $(CH_IT_CONTAINER) \
+		--ulimit nofile=262144:262144 \
+		-e CLICKHOUSE_USER=$(CH_IT_USER) -e CLICKHOUSE_PASSWORD=$(CH_IT_PASSWORD) \
+		-p 19000:9000 -p 18123:8123 \
+		$(CH_IT_IMAGE) >/dev/null
+	@trap '$(CONTAINER_TOOL) rm -f $(CH_IT_CONTAINER) >/dev/null 2>&1 || true' EXIT; \
+	echo "Waiting for ClickHouse to accept connections..."; \
+	for i in $$(seq 1 30); do \
+		if $(CONTAINER_TOOL) exec $(CH_IT_CONTAINER) clickhouse-client --user $(CH_IT_USER) --password $(CH_IT_PASSWORD) --query "SELECT 1" >/dev/null 2>&1; then \
+			echo "ClickHouse is ready."; \
+			break; \
+		fi; \
+		if [ $$i -eq 30 ]; then echo "ClickHouse did not become ready in time"; exit 1; fi; \
+		sleep 1; \
+	done; \
+	CH_TEST_ADDR=$(CH_IT_ADDR) CH_TEST_USER=$(CH_IT_USER) CH_TEST_PASSWORD=$(CH_IT_PASSWORD) \
+		go test -tags=integration ./internal/controller/... -run Integration -v
+
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # kubectl kuberc is disabled by default for test isolation; enable with:

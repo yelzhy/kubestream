@@ -39,9 +39,19 @@ type ResourceRecord struct {
 	UID             string            `json:"uid"`
 	ResourceVersion string            `json:"resource_version"`
 	Labels          map[string]string `json:"labels"`
-	Data            string            `json:"data"`      // Full JSON (for Added)
-	DiffData        string            `json:"diff_data"` // Change delta (for Modified)
-	SHA256          string            `json:"sha256"`
+	// Actors are the field-manager names harvested from the object's
+	// managedFields (see the resource_states.actors column). The field exists
+	// from Task 0.2 so the new column binds and this package compiles; it is
+	// always empty here (every row writes []) and is populated by Task 0.3's
+	// managedFields extraction. Deleted rows carry no actors — there is no live
+	// object to inspect.
+	Actors []string `json:"actors"`
+	Data   string   `json:"data"` // Full JSON (for Added)
+	// Diff is an RFC 6902 JSON Patch (wI2L/jsondiff) describing the change on a
+	// Modified event; empty on every other event type. Named to match the
+	// schema-v1 "diff" column (renamed from the old "diff_data").
+	Diff   string `json:"diff"`
+	SHA256 string `json:"sha256"`
 }
 
 // ClickHouseConfig holds the externally configurable ClickHouse connection
@@ -55,6 +65,11 @@ type ClickHouseConfig struct {
 	Password    string
 	DialTimeout time.Duration
 	ReadTimeout time.Duration
+	// AutoCreateSchema, when true, makes the operator execute the shipped DDL
+	// (deploy/clickhouse/schema) idempotently at connect time before validating
+	// the live schema. Sourced from --ch-auto-create-schema / CH_AUTO_CREATE_SCHEMA;
+	// defaults to false so the operator never mutates ClickHouse DDL unless asked.
+	AutoCreateSchema bool
 }
 
 // ReconcilerConfig holds operator-level settings that aren't specific to the
@@ -84,14 +99,20 @@ type ReconcilerConfig struct {
 
 // insertArgs returns the positional arguments for the resource_states INSERT
 // used by CHWriter, in exactly the column order expected by
-// insertResourceStateQuery.
+// insertResourceStateQuery. nil Labels/Actors are coerced to empty containers
+// so the Map/Array columns always bind a concrete value rather than a NULL the
+// non-nullable schema would reject.
 func (rec ResourceRecord) insertArgs() []any {
 	labels := rec.Labels
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	actors := rec.Actors
+	if actors == nil {
+		actors = []string{}
+	}
 	return []any{
 		rec.Timestamp.UTC().Format(chTimeFormat), rec.ClusterID, rec.EventType, rec.APIGroup, rec.APIVersion,
-		rec.Kind, rec.Namespace, rec.Name, rec.UID, rec.ResourceVersion, labels, rec.Data, rec.DiffData, rec.SHA256,
+		rec.Kind, rec.Namespace, rec.Name, rec.UID, rec.ResourceVersion, labels, actors, rec.Data, rec.Diff, rec.SHA256,
 	}
 }

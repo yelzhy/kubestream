@@ -60,44 +60,23 @@ Informer cache (per watched GVK)
 - **One `CHWriter` per manager, shared across every watched GVK**: registered as a `manager.Runnable`, its own lifecycle (start workers → drain the queue on shutdown → close the ClickHouse connection) is tied to the manager's.
 - **One `hashCache` per GVK**: a mutex-protected map from `"<Kind>/<namespace>/<name>"` to a versioned `CacheEntry` (hash, normalized JSON, UID, version, pending-delete flag). All commits/deletes are gated on the version issued when the corresponding write was reserved.
 - **Startup warm-up + GC**: for each watched GVK, a `restoreAndWarm` goroutine queries ClickHouse for the latest known state of every object, seeds the cache (without clobbering anything a live `Reconcile` already wrote), then diffs that snapshot against the live cluster to detect and close out "zombie" objects that disappeared while the operator was offline.
-- **ClickHouse schema is not shipped in this repository** — you must create the target table yourself before deploying (see [ClickHouse schema](#clickhouse-schema) below).
+- **ClickHouse schema v1 is shipped in this repository** — the DDL lives under [`deploy/clickhouse/schema/`](deploy/clickhouse/schema/) and every column is documented in [`docs/SCHEMA.md`](docs/SCHEMA.md).
 
 ### ClickHouse schema
 
-`kubestream` writes to (and reads history from) a single table named `resource_states`, using this exact query shape (from `internal/controller/chwriter.go`):
+`kubestream` writes the per-object change stream to `resource_states` and the
+watch-scope epoch log to `watch_scopes`. The full, authoritative DDL is shipped
+in-repo and documented column-by-column:
 
-```sql
-INSERT INTO resource_states (
-    ts, cluster_id, event_type, api_group, api_version, kind, namespace, name,
-    uid, resource_version, labels, data, diff_data, sha256
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-```
+- **DDL:** [`deploy/clickhouse/schema/001_resource_states.sql`](deploy/clickhouse/schema/001_resource_states.sql), [`deploy/clickhouse/schema/002_watch_scopes.sql`](deploy/clickhouse/schema/002_watch_scopes.sql)
+- **Reference:** [`docs/SCHEMA.md`](docs/SCHEMA.md) — column semantics, the `event_type` state machine, the RFC 6902 diff format, the version-agnostic identity rule, and a suggested (optional) `TTL` clause.
 
-No DDL/migration is included in this repo — you are responsible for creating a compatible table. A minimal example that matches the columns and types the writer sends:
-
-```sql
-CREATE TABLE resource_states
-(
-    ts               DateTime64(9),
-    cluster_id       String,
-    event_type       LowCardinality(String), -- Added | Modified | Deleted | Snapshot
-    api_group        String,
-    api_version      String,
-    kind             String,
-    namespace        String,
-    name             String,
-    uid              String,
-    resource_version String,
-    labels           Map(String, String),
-    data             String,
-    diff_data        String,
-    sha256           String
-)
-ENGINE = MergeTree
-ORDER BY (kind, namespace, name, ts);
-```
-
-Tune the engine/ordering/partitioning to your own retention and query patterns — the operator only depends on the column list above, plus being able to run `SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts) FROM resource_states WHERE kind = ? AND cluster_id = ? GROUP BY namespace, name HAVING argMax(event_type, ts) != 'Deleted'` for its startup warm-up/GC pass.
+Apply the two `.sql` files yourself, or start the operator with
+`--ch-auto-create-schema=true` to have it execute the shipped DDL idempotently
+at connect time. Either way, on connect the operator introspects
+`system.columns` and validates the live tables against schema v1; a mismatch is
+logged and degrades the `clickhouse-schema` readiness probe (it does not
+crash-loop).
 
 ## Configuration
 
@@ -111,6 +90,7 @@ Every setting is available as both a CLI flag and an environment variable (flag 
 | — | `CH_PASSWORD` | *(empty)* | ClickHouse password. Env-only by design — flag values are visible in `ps`; connects passwordless if unset (logged as a warning). |
 | `--ch-dial-timeout` | `CH_DIAL_TIMEOUT` | `5s` | Timeout for establishing the ClickHouse connection. |
 | `--ch-read-timeout` | `CH_READ_TIMEOUT` | `10s` | Timeout for a single ClickHouse query/insert round-trip; also governs the async writer's per-attempt insert timeout. |
+| `--ch-auto-create-schema` | `CH_AUTO_CREATE_SCHEMA` | `false` | Execute the shipped DDL (`deploy/clickhouse/schema`) idempotently at connect time. Off by default — the operator never mutates ClickHouse DDL unless asked. |
 | `--cluster-id` | `CLUSTER_ID` | `local-kind-cluster` | Identifier for this cluster, recorded on every row. |
 | `--reconciler-max-concurrent` | `RECONCILER_MAX_CONCURRENT` | `5` | Max concurrent `Reconcile` calls per watched resource type. |
 | `--watched-gvks` | `WATCHED_GVKS` | `v1/Pod,apps/v1/Deployment,v1/Service` | Comma-separated list of resource types to watch, as `version/kind` or `group/version/kind`. Adding a type outside the default RBAC grant requires extending `config/rbac/role.yaml`. |
@@ -151,7 +131,7 @@ kubestream registers the following pipeline metrics on controller-runtime's glob
 - Go v1.25+ (see `go.mod`)
 - Docker (or another `CONTAINER_TOOL`) for building the operator image
 - `kubectl`, and access to a Kubernetes cluster
-- A reachable ClickHouse instance, with the `resource_states` table already created (see [ClickHouse schema](#clickhouse-schema))
+- A reachable ClickHouse instance, with the schema v1 tables created — either apply [`deploy/clickhouse/schema/*.sql`](deploy/clickhouse/schema/) yourself or start the operator with `--ch-auto-create-schema=true` (see [ClickHouse schema](#clickhouse-schema))
 
 This project does not define a CRD — there is nothing to `make install` beyond the operator itself; it only watches existing built-in resource types (or others you configure via `WATCHED_GVKS`).
 

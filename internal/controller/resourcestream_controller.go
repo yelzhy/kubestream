@@ -192,6 +192,9 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 
 	log.Info("🗑️ Object gone, queuing Deleted event for ClickHouse", "kind", r.GVK.Kind, "namespace", namespace, "name", name, "uid", entry.UID)
 
+	// A Deleted row carries empty data, diff, and sha256: event_type alone
+	// carries deletion semantics in schema v1 (see docs/SCHEMA.md), replacing
+	// the pre-v1 data/sha256 deletion sentinels.
 	record := ResourceRecord{
 		Timestamp:  time.Now().UTC(),
 		ClusterID:  r.ClusterID,
@@ -202,8 +205,6 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 		Namespace:  namespace,
 		Name:       name,
 		UID:        entry.UID,
-		Data:       `{"status": "deleted"}`,
-		SHA256:     "DELETED",
 	}
 
 	// The cache entry is only removed once the deletion record is durably
@@ -375,6 +376,8 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// "not yet claimed" and independently enqueue their own
 			// "Deleted" row for the same old UID.
 			if claimedEntry, _, claimed := r.HashCache.ReserveDelete(objectKey, cachedEntry.UID); claimed {
+				// Deleted rows carry empty data/diff/sha256 in schema v1 —
+				// event_type alone marks the deletion (see docs/SCHEMA.md).
 				closeRecord := ResourceRecord{
 					Timestamp:  time.Now().UTC(),
 					ClusterID:  r.ClusterID,
@@ -385,8 +388,6 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					Namespace:  req.Namespace,
 					Name:       req.Name,
 					UID:        claimedEntry.UID,
-					Data:       `{"status": "deleted"}`,
-					SHA256:     "DELETED",
 				}
 
 				// 1. Close out the old object's history — failures are
@@ -501,7 +502,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		ResourceVersion: originalRV,
 		Labels:          labels,
 		Data:            dataString,
-		DiffData:        diffString,
+		Diff:            diffString,
 		SHA256:          hashString,
 	}
 
@@ -574,6 +575,25 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 	chWriter.WaitForOthers(&connUsers)
 
 	if err := mgr.Add(chWriter); err != nil {
+		return err
+	}
+
+	// Connect-time schema validation. A dedicated readyz check degrades
+	// readiness if the live tables drift from schema v1 (see schema.go), and a
+	// background runnable does the actual introspection so mgr.Start is never
+	// gated on ClickHouse being reachable at boot. It shares conn, so it is
+	// tracked in connUsers exactly like restoreAndWarm — CHWriter waits for
+	// that group before closing conn on shutdown.
+	schemaGate := newSchemaGate()
+	if err := mgr.AddReadyzCheck("clickhouse-schema", schemaGate.readyCheck); err != nil {
+		return err
+	}
+	connUsers.Add(1)
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		defer connUsers.Done()
+		validateSchemaWithRetry(ctx, conn, chConfig.Database, chConfig.AutoCreateSchema, schemaGate, logf.Log.WithName("schema"))
+		return nil
+	})); err != nil {
 		return err
 	}
 
@@ -662,13 +682,19 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 	warm := func() error {
 		targetsToCheck = nil
 
+		// Filtering on api_group as well as kind keeps two different resources
+		// that share a Kind (e.g. batch/v1 Job vs. a CRD example.com/v1 Job)
+		// from cross-contaminating each other's warm-up history — the schema-v1
+		// identity is (cluster_id, api_group, kind, namespace, name). The full
+		// in-process identity-key builder lands in Task 0.4; this query only
+		// needs the api_group discriminator now that the column is first-class.
 		rows, err := conn.Query(ctx, `
             SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts)
             FROM resource_states
-            WHERE kind = ? AND cluster_id = ?
+            WHERE api_group = ? AND kind = ? AND cluster_id = ?
             GROUP BY namespace, name
             HAVING argMax(event_type, ts) != 'Deleted'
-        `, gvk.Kind, reconciler.ClusterID)
+        `, gvk.Group, gvk.Kind, reconciler.ClusterID)
 		if err != nil {
 			return err
 		}
