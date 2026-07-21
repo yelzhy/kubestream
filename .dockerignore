@@ -9,3 +9,6 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include ClickHouse schema DDL for go:embed
+!deploy/clickhouse/schema/*.sql
