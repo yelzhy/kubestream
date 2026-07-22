@@ -23,6 +23,7 @@ package clickhouse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -40,6 +41,8 @@ import (
 const (
 	defaultWriteQueueSize       = 5000
 	defaultWriteWorkers         = 4
+	defaultBatchMaxRows         = 1000
+	defaultBatchMaxWait         = 1 * time.Second
 	defaultInsertTimeout        = 5 * time.Second
 	defaultEnqueueTimeout       = 2 * time.Second
 	defaultMaxRetryBackoff      = 60 * time.Second
@@ -69,6 +72,14 @@ type Config struct {
 	// the live schema. Sourced from --ch-auto-create-schema / CH_AUTO_CREATE_SCHEMA;
 	// defaults to false so the operator never mutates ClickHouse DDL unless asked.
 	AutoCreateSchema bool
+	// BatchMaxRows is the row count at which a worker flushes its accumulated
+	// batch to ClickHouse; BatchMaxWait is the maximum time a batch's first job
+	// waits for the batch to fill before it is flushed regardless. These are the
+	// client-side batching knobs (row-per-INSERT is ClickHouse's pathological
+	// write pattern); flags plumb into them in Task 0.8. Zero values fall back
+	// to the package defaults in NewCHWriter.
+	BatchMaxRows int
+	BatchMaxWait time.Duration
 }
 
 // Metrics is the narrow slice of pipeline metrics CHWriter records. It is an
@@ -90,6 +101,8 @@ type Metrics interface {
 	IncWriteRetryAttempt()
 	// IncWrite counts one settled write by outcome ("success" | "failed").
 	IncWrite(outcome string)
+	// ObserveWriteBatchRows records the row count of one flushed insert batch.
+	ObserveWriteBatchRows(rows float64)
 }
 
 // writeJob is a single ClickHouse insert drained by a CHWriter worker. It is the
@@ -117,6 +130,12 @@ type CHWriter struct {
 
 	jobs    chan writeJob
 	workers int
+
+	// batchMaxRows / batchMaxWait govern client-side batching: a worker flushes
+	// its accumulated batch once it holds batchMaxRows jobs or batchMaxWait has
+	// elapsed since the batch's first job, whichever comes first. See worker.
+	batchMaxRows int
+	batchMaxWait time.Duration
 
 	insertTimeout        time.Duration
 	maxRetryBackoff      time.Duration
@@ -155,12 +174,18 @@ type CHWriter struct {
 // the metrics sink it reports to. Zero-valued queueSize/workers/timeouts fall
 // back to sane defaults. Exposed (rather than only Open) so tests can drive the
 // writer with a fake driver.Conn and an isolated metrics instance.
-func NewCHWriter(conn driver.Conn, queueSize, workers int, insertTimeout, maxRetryBackoff, shutdownDrainTimeout time.Duration, metrics Metrics) *CHWriter {
+func NewCHWriter(conn driver.Conn, queueSize, workers, batchMaxRows int, insertTimeout, maxRetryBackoff, shutdownDrainTimeout, batchMaxWait time.Duration, metrics Metrics) *CHWriter {
 	if queueSize <= 0 {
 		queueSize = defaultWriteQueueSize
 	}
 	if workers <= 0 {
 		workers = defaultWriteWorkers
+	}
+	if batchMaxRows <= 0 {
+		batchMaxRows = defaultBatchMaxRows
+	}
+	if batchMaxWait <= 0 {
+		batchMaxWait = defaultBatchMaxWait
 	}
 	if insertTimeout <= 0 {
 		insertTimeout = defaultInsertTimeout
@@ -175,6 +200,8 @@ func NewCHWriter(conn driver.Conn, queueSize, workers int, insertTimeout, maxRet
 		conn:                 conn,
 		jobs:                 make(chan writeJob, queueSize),
 		workers:              workers,
+		batchMaxRows:         batchMaxRows,
+		batchMaxWait:         batchMaxWait,
 		insertTimeout:        insertTimeout,
 		maxRetryBackoff:      maxRetryBackoff,
 		shutdownDrainTimeout: shutdownDrainTimeout,
@@ -203,7 +230,7 @@ func Open(cfg Config, metrics Metrics) (*CHWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := NewCHWriter(conn, 0, 0, cfg.ReadTimeout, 0, 0, metrics)
+	w := NewCHWriter(conn, 0, 0, cfg.BatchMaxRows, cfg.ReadTimeout, 0, 0, cfg.BatchMaxWait, metrics)
 	w.database = cfg.Database
 	w.autoCreate = cfg.AutoCreateSchema
 	return w, nil
@@ -301,9 +328,10 @@ func (w *CHWriter) Enqueue(ctx context.Context, job sink.Job) error {
 //  3. Wait for any Enqueue call already past the closing check to finish
 //     sending (or bail via its own ctx/timeout) — after this, jobs can
 //     receive no further sends from anyone.
-//  4. Close jobs. Workers range over it, so they drain every already-queued
-//     job and then exit cleanly once it's both empty and closed — no worker
-//     can exit "too early" and leave a job stranded.
+//  4. Close jobs. Each worker receives from it until it is drained and closed,
+//     flushing its partial in-flight batch on the final (closed) receive, then
+//     exits cleanly — no worker can exit "too early" and leave a job (or a
+//     buffered batch) stranded.
 //  5. Wait for otherUsers — the LastKnownStates / schema-validation goroutines
 //     that share conn.
 //  6. Close conn — guaranteed safe now, since nothing can still be using it.
@@ -317,9 +345,7 @@ func (w *CHWriter) Start(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < w.workers; i++ {
 		wg.Go(func() {
-			for job := range w.jobs {
-				w.process(w.attemptContext(ctx), log, job)
-			}
+			w.worker(ctx, log)
 		})
 	}
 
@@ -367,48 +393,170 @@ func (w *CHWriter) attemptContext(ctx context.Context) context.Context {
 	return w.drainCtx
 }
 
-// process writes a single job to ClickHouse, retrying with exponential
-// backoff. Each attempt's deadline is derived from ctx (the same context
-// Start received), so a manager shutdown cancels an in-flight attempt
-// immediately instead of letting it run for a full insertTimeout. It always
-// reports the outcome via job.commit exactly once, only after the write is
-// truly settled.
+// worker drains w.jobs, accumulating jobs into a batch and flushing it once it
+// reaches batchMaxRows or batchMaxWait has elapsed since the batch's first job,
+// whichever comes first. The batchMaxWait timer is armed only while a batch is
+// non-empty (an empty batch selects on a nil channel), so an idle worker never
+// busy-waits or fires a spurious empty flush.
+//
+// Trickle traffic accepts batchMaxWait as its write-latency ceiling: a lone job
+// waits up to batchMaxWait for batch-mates that never arrive before it flushes.
+// Tune batchMaxWait down to trade batch efficiency for lower trickle latency.
+//
+// On the final receive (w.jobs closed and drained) the worker flushes its
+// partial in-flight batch before returning, so Start's drain phase never
+// strands a buffered batch.
 //
 //nolint:logcheck
-func (w *CHWriter) process(ctx context.Context, log logr.Logger, job writeJob) {
-	// A job leaves the queue the moment we pull it, so refresh depth here too —
-	// not only on enqueue — so a draining queue is reflected, not just a
-	// filling one.
-	w.metrics.SetWriteQueueDepth(float64(len(w.jobs)))
+func (w *CHWriter) worker(ctx context.Context, log logr.Logger) {
+	batch := make([]writeJob, 0, w.batchMaxRows)
 
+	// timerC is nil while the batch is empty, so the select below cannot fire a
+	// wait-driven flush on an empty batch and does not busy-wait when idle.
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	disarm := func() {
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+			timerC = nil
+		}
+	}
+
+	for {
+		select {
+		case job, ok := <-w.jobs:
+			if !ok {
+				// Channel closed and drained: flush whatever we still hold
+				// (within Start's drain window) and exit.
+				if len(batch) > 0 {
+					w.flushBatch(w.attemptContext(ctx), log, batch)
+				}
+				disarm()
+				return
+			}
+			batch = append(batch, job)
+			if len(batch) == 1 {
+				// First job of a new batch: arm the wait ceiling now, not before.
+				timer = time.NewTimer(w.batchMaxWait)
+				timerC = timer.C
+			}
+			if len(batch) >= w.batchMaxRows {
+				w.flushBatch(w.attemptContext(ctx), log, batch)
+				batch = batch[:0]
+				disarm()
+			}
+		case <-timerC:
+			// batchMaxWait elapsed with a partially-filled batch: flush it. The
+			// batch is non-empty by construction (the timer is armed only when
+			// the first job lands and disarmed on every flush).
+			timer = nil
+			timerC = nil
+			w.flushBatch(w.attemptContext(ctx), log, batch)
+			batch = batch[:0]
+		}
+	}
+}
+
+// flushBatch persists a full batch of jobs to ClickHouse and settles each job's
+// commit callback. It is the sole place a batch's outcomes are settled, and it
+// guarantees the exactly-once contract sink.Job documents:
+//
+//	Every commit callback fires exactly once per job across all paths.
+//
+// The happy path prepares one client-side batch and Sends it (row-per-INSERT is
+// ClickHouse's pathological write pattern), retrying the whole batch with the
+// shared exponential backoff. If the batch still fails after retries, poison
+// isolation kicks in: each row is re-attempted once on its own, so a single bad
+// row cannot doom its blameless batch-mates — only the individually-failing
+// rows get commit(false) (and the caller's revert/requeue path), the rest get
+// commit(true).
+//
+//nolint:logcheck
+func (w *CHWriter) flushBatch(ctx context.Context, log logr.Logger, batch []writeJob) {
+	// A batch leaves the queue as it is assembled, so refresh depth here too —
+	// not only on enqueue — so a draining queue is reflected, not just a
+	// filling one. write_batch_rows is emitted once per flush.
+	w.metrics.SetWriteQueueDepth(float64(len(w.jobs)))
+	w.metrics.ObserveWriteBatchRows(float64(len(batch)))
+
+	start := time.Now()
+	err := w.sendBatch(ctx, batch)
+	if err == nil {
+		elapsed := time.Since(start).Seconds()
+		for _, job := range batch {
+			w.metrics.ObserveWriteLatency(elapsed)
+			w.metrics.IncWrite("success")
+			if job.commit != nil {
+				job.commit(true)
+			}
+		}
+		return
+	}
+
+	// Batch exhausted retries. Re-attempt each row individually, exactly once,
+	// so one poison row is blamed in isolation rather than failing the batch.
+	log.Error(err, "chwriter: batch write failed after retries; isolating rows individually", "rows", len(batch))
+	for _, job := range batch {
+		rowStart := time.Now()
+		rowCtx, cancel := context.WithTimeout(ctx, w.insertTimeout)
+		rowErr := w.conn.Exec(rowCtx, job.query, job.args...)
+		cancel()
+
+		w.metrics.ObserveWriteLatency(time.Since(rowStart).Seconds())
+		if rowErr != nil {
+			w.metrics.IncWrite("failed")
+			log.Error(rowErr, "chwriter: giving up on row after individual retry")
+		} else {
+			w.metrics.IncWrite("success")
+		}
+		if job.commit != nil {
+			job.commit(rowErr == nil)
+		}
+	}
+}
+
+// sendBatch prepares and sends the whole batch as one client-side INSERT,
+// retrying the entire batch with the shared exponential backoff. Each attempt's
+// deadline is derived from ctx (see attemptContext), so a manager shutdown
+// cancels an in-flight attempt immediately instead of letting it run for a full
+// insertTimeout. It never touches commit callbacks — flushBatch owns settling.
+func (w *CHWriter) sendBatch(ctx context.Context, batch []writeJob) error {
 	eb := backoff.NewExponentialBackOff()
 	eb.MaxElapsedTime = w.maxRetryBackoff
 
-	start := time.Now()
 	attempts := 0
-	err := backoff.Retry(func() error {
+	return backoff.Retry(func() error {
 		// Every attempt after the first is a retry; counting them here (rather
 		// than the successes) is what makes a retry storm visible even when the
-		// writes ultimately succeed.
+		// batch ultimately succeeds.
 		if attempts > 0 {
 			w.metrics.IncWriteRetryAttempt()
 		}
 		attempts++
-		writeCtx, cancel := context.WithTimeout(ctx, w.insertTimeout)
-		defer cancel()
-		return w.conn.Exec(writeCtx, job.query, job.args...)
+		return w.sendBatchOnce(ctx, batch)
 	}, backoff.WithContext(eb, ctx))
+}
 
-	w.metrics.ObserveWriteLatency(time.Since(start).Seconds())
+// sendBatchOnce performs a single batch attempt: prepare a batch, append every
+// row, and send. All rows share insertResourceStateQuery (the driver normalizes
+// away the VALUES clause for PrepareBatch), so no per-job query is needed here.
+// On an Append failure the half-built batch is aborted so it is not leaked, and
+// both errors are surfaced (no silent error) so the backoff sees a real failure.
+func (w *CHWriter) sendBatchOnce(ctx context.Context, batch []writeJob) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, w.insertTimeout)
+	defer cancel()
+
+	b, err := w.conn.PrepareBatch(attemptCtx, insertResourceStateQuery)
 	if err != nil {
-		w.metrics.IncWrite("failed")
-		log.Error(err, "chwriter: giving up on write after exhausting retries")
-	} else {
-		w.metrics.IncWrite("success")
+		return err
 	}
-	if job.commit != nil {
-		job.commit(err == nil)
+	for _, job := range batch {
+		if appendErr := b.Append(job.args...); appendErr != nil {
+			return errors.Join(appendErr, b.Abort())
+		}
 	}
+	return b.Send()
 }
 
 // insertArgs returns the positional arguments for the resource_states INSERT,

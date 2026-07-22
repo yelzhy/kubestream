@@ -64,6 +64,12 @@ type PipelineMetrics struct {
 	// retry storms that writesTotal alone hides (a write can succeed after
 	// many retries and still count only once as a success).
 	writeRetryAttempts prometheus.Counter
+	// writeBatchRows records the number of rows in each flushed ClickHouse
+	// batch, observed once per flush. It is the direct signal of how well the
+	// batcher is coalescing: a distribution clustered near batchMaxRows means
+	// full, efficient batches, while a mass near 1 means trickle traffic is
+	// flushing on the batchMaxWait timer instead of filling batches.
+	writeBatchRows prometheus.Histogram
 
 	// enqueueBlock measures how long Enqueue blocks waiting for queue room —
 	// the hot-path backpressure the reconciler actually feels. enqueueTimeouts
@@ -121,6 +127,14 @@ func NewPipelineMetrics(reg prometheus.Registerer) *PipelineMetrics {
 			Name:      "write_retry_attempts_total",
 			Help:      "Count of write attempts beyond the first (i.e. retries) across all jobs.",
 		}),
+		writeBatchRows: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Name:      "write_batch_rows",
+			Help:      "Number of rows in each flushed ClickHouse insert batch.",
+			// Exponential buckets 1..2048 span a single trickle row through a
+			// full batch at any realistic batchMaxRows setting.
+			Buckets: prometheus.ExponentialBuckets(1, 2, 12),
+		}),
 		enqueueBlock: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Name:      "enqueue_block_seconds",
@@ -166,6 +180,7 @@ func NewPipelineMetrics(reg prometheus.Registerer) *PipelineMetrics {
 		m.writesTotal,
 		m.writeLatency,
 		m.writeRetryAttempts,
+		m.writeBatchRows,
 		m.enqueueBlock,
 		m.enqueueTimeouts,
 		m.dedupSkips,
@@ -214,6 +229,9 @@ func (m *PipelineMetrics) ObserveWriteLatency(seconds float64) { m.writeLatency.
 
 // IncWriteRetryAttempt counts one write attempt beyond the first.
 func (m *PipelineMetrics) IncWriteRetryAttempt() { m.writeRetryAttempts.Inc() }
+
+// ObserveWriteBatchRows records the row count of one flushed insert batch.
+func (m *PipelineMetrics) ObserveWriteBatchRows(rows float64) { m.writeBatchRows.Observe(rows) }
 
 // IncWrite counts one settled write by outcome ("success" | "failed").
 func (m *PipelineMetrics) IncWrite(outcome string) { m.writesTotal.WithLabelValues(outcome).Inc() }
