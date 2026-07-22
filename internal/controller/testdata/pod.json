@@ -1,0 +1,241 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "checkout-api-7d9f8c6b54-x2k9p",
+    "namespace": "payments",
+    "uid": "6f3a1c2e-9b4d-4a7e-8c1f-2d5e6f7a8b9c",
+    "labels": {
+      "app.kubernetes.io/name": "checkout-api",
+      "app.kubernetes.io/instance": "checkout-api-prod",
+      "app.kubernetes.io/version": "2.14.3",
+      "app.kubernetes.io/component": "backend",
+      "app.kubernetes.io/part-of": "payments-platform",
+      "app.kubernetes.io/managed-by": "argocd",
+      "pod-template-hash": "7d9f8c6b54",
+      "security.istio.io/tlsMode": "istio",
+      "service.istio.io/canonical-name": "checkout-api",
+      "service.istio.io/canonical-revision": "2.14.3",
+      "team": "payments",
+      "tier": "backend"
+    },
+    "annotations": {
+      "kubectl.kubernetes.io/default-container": "checkout-api",
+      "kubectl.kubernetes.io/default-logs-container": "checkout-api",
+      "prometheus.io/scrape": "true",
+      "prometheus.io/port": "9090",
+      "prometheus.io/path": "/metrics",
+      "kubernetes.io/psp": "restricted",
+      "sidecar.istio.io/status": "{\"initContainers\":[\"istio-init\"],\"containers\":[\"istio-proxy\"],\"volumes\":[\"workload-socket\",\"credential-socket\",\"workload-certs\",\"istio-envoy\",\"istio-data\",\"istio-podinfo\",\"istio-token\",\"istiod-ca-cert\"],\"imagePullSecrets\":null,\"revision\":\"default\"}"
+    },
+    "ownerReferences": [
+      {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "checkout-api-7d9f8c6b54",
+        "uid": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+        "controller": true,
+        "blockOwnerDeletion": true
+      }
+    ]
+  },
+  "spec": {
+    "serviceAccountName": "checkout-api",
+    "restartPolicy": "Always",
+    "terminationGracePeriodSeconds": 30,
+    "dnsPolicy": "ClusterFirst",
+    "schedulerName": "default-scheduler",
+    "priority": 0,
+    "enableServiceLinks": true,
+    "securityContext": {
+      "runAsUser": 1000,
+      "runAsGroup": 3000,
+      "runAsNonRoot": true,
+      "fsGroup": 2000,
+      "seccompProfile": {"type": "RuntimeDefault"}
+    },
+    "affinity": {
+      "podAntiAffinity": {
+        "preferredDuringSchedulingIgnoredDuringExecution": [
+          {
+            "weight": 100,
+            "podAffinityTerm": {
+              "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "checkout-api"}},
+              "topologyKey": "kubernetes.io/hostname"
+            }
+          }
+        ]
+      },
+      "nodeAffinity": {
+        "requiredDuringSchedulingIgnoredDuringExecution": {
+          "nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/os", "operator": "In", "values": ["linux"]}]}
+          ]
+        }
+      }
+    },
+    "tolerations": [
+      {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+      {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+      {"key": "workload", "operator": "Equal", "value": "payments", "effect": "NoSchedule"}
+    ],
+    "initContainers": [
+      {
+        "name": "istio-init",
+        "image": "docker.io/istio/proxyv2:1.22.3",
+        "imagePullPolicy": "IfNotPresent",
+        "args": ["istio-iptables", "-p", "15001", "-z", "15006", "-u", "1337", "-m", "REDIRECT", "-i", "*", "-x", "", "-b", "*", "-d", "15090,15021,15020", "--log_output_level=default:info"],
+        "resources": {
+          "limits": {"cpu": "2", "memory": "1Gi"},
+          "requests": {"cpu": "100m", "memory": "128Mi"}
+        },
+        "securityContext": {
+          "runAsUser": 0,
+          "runAsGroup": 0,
+          "runAsNonRoot": false,
+          "privileged": false,
+          "capabilities": {"add": ["NET_ADMIN", "NET_RAW"], "drop": ["ALL"]}
+        }
+      }
+    ],
+    "containers": [
+      {
+        "name": "checkout-api",
+        "image": "registry.internal.example.com/payments/checkout-api:2.14.3",
+        "imagePullPolicy": "IfNotPresent",
+        "ports": [
+          {"name": "http", "containerPort": 8080, "protocol": "TCP"},
+          {"name": "metrics", "containerPort": 9090, "protocol": "TCP"}
+        ],
+        "env": [
+          {"name": "DATABASE_URL", "valueFrom": {"secretKeyRef": {"name": "checkout-db", "key": "url"}}},
+          {"name": "DATABASE_MAX_CONNECTIONS", "value": "25"},
+          {"name": "DATABASE_IDLE_TIMEOUT", "value": "300s"},
+          {"name": "REDIS_HOST", "value": "redis.payments.svc.cluster.local"},
+          {"name": "REDIS_PORT", "value": "6379"},
+          {"name": "REDIS_DB", "value": "0"},
+          {"name": "LOG_LEVEL", "value": "info"},
+          {"name": "LOG_FORMAT", "value": "json"},
+          {"name": "HTTP_READ_TIMEOUT", "value": "15s"},
+          {"name": "HTTP_WRITE_TIMEOUT", "value": "15s"},
+          {"name": "FEATURE_FLAG_NEW_CHECKOUT", "value": "true"},
+          {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://otel-collector.observability.svc.cluster.local:4317"},
+          {"name": "OTEL_SERVICE_NAME", "value": "checkout-api"},
+          {"name": "POD_NAME", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}},
+          {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"}}},
+          {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "spec.nodeName"}}}
+        ],
+        "resources": {
+          "limits": {"cpu": "1", "memory": "512Mi"},
+          "requests": {"cpu": "250m", "memory": "256Mi"}
+        },
+        "volumeMounts": [
+          {"name": "config", "mountPath": "/etc/checkout-api", "readOnly": true},
+          {"name": "tmp", "mountPath": "/tmp"},
+          {"name": "kube-api-access", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true}
+        ],
+        "livenessProbe": {
+          "httpGet": {"path": "/healthz", "port": 8080, "scheme": "HTTP"},
+          "initialDelaySeconds": 15,
+          "periodSeconds": 10,
+          "timeoutSeconds": 1,
+          "successThreshold": 1,
+          "failureThreshold": 3
+        },
+        "readinessProbe": {
+          "httpGet": {"path": "/readyz", "port": 8080, "scheme": "HTTP"},
+          "initialDelaySeconds": 5,
+          "periodSeconds": 10,
+          "timeoutSeconds": 1,
+          "successThreshold": 1,
+          "failureThreshold": 3
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File"
+      },
+      {
+        "name": "istio-proxy",
+        "image": "docker.io/istio/proxyv2:1.22.3",
+        "imagePullPolicy": "IfNotPresent",
+        "args": ["proxy", "sidecar", "--domain", "$(POD_NAMESPACE).svc.cluster.local", "--proxyLogLevel=warning", "--proxyComponentLogLevel=misc:error", "--log_output_level=default:info", "--concurrency", "2"],
+        "ports": [
+          {"name": "http-envoy-prom", "containerPort": 15090, "protocol": "TCP"}
+        ],
+        "env": [
+          {"name": "JWT_POLICY", "value": "third-party-jwt"},
+          {"name": "PILOT_CERT_PROVIDER", "value": "istiod"},
+          {"name": "CA_ADDR", "value": "istiod.istio-system.svc:15012"},
+          {"name": "POD_NAME", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}},
+          {"name": "ISTIO_META_WORKLOAD_NAME", "value": "checkout-api"},
+          {"name": "ISTIO_META_MESH_ID", "value": "cluster.local"},
+          {"name": "ISTIO_META_CLUSTER_ID", "value": "Kubernetes"}
+        ],
+        "resources": {
+          "limits": {"cpu": "2", "memory": "1Gi"},
+          "requests": {"cpu": "100m", "memory": "128Mi"}
+        },
+        "volumeMounts": [
+          {"name": "workload-socket", "mountPath": "/var/run/secrets/workload-spiffe-uds"},
+          {"name": "istio-envoy", "mountPath": "/etc/istio/proxy"},
+          {"name": "istio-data", "mountPath": "/var/lib/istio/data"},
+          {"name": "istio-podinfo", "mountPath": "/etc/istio/pod"},
+          {"name": "istiod-ca-cert", "mountPath": "/var/run/secrets/istio"}
+        ],
+        "readinessProbe": {
+          "httpGet": {"path": "/healthz/ready", "port": 15021, "scheme": "HTTP"},
+          "initialDelaySeconds": 1,
+          "periodSeconds": 2,
+          "timeoutSeconds": 3,
+          "successThreshold": 1,
+          "failureThreshold": 30
+        }
+      }
+    ],
+    "volumes": [
+      {"name": "config", "configMap": {"name": "checkout-api-config", "defaultMode": 420}},
+      {"name": "tmp", "emptyDir": {}},
+      {"name": "workload-socket", "emptyDir": {}},
+      {"name": "istio-envoy", "emptyDir": {"medium": "Memory"}},
+      {"name": "istio-data", "emptyDir": {}},
+      {"name": "istio-podinfo", "downwardAPI": {"defaultMode": 420, "items": [{"path": "labels", "fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.labels"}}, {"path": "annotations", "fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.annotations"}}]}},
+      {"name": "istiod-ca-cert", "configMap": {"name": "istio-ca-root-cert", "defaultMode": 420}},
+      {"name": "kube-api-access", "projected": {"defaultMode": 420, "sources": [{"serviceAccountToken": {"expirationSeconds": 3607, "path": "token"}}, {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]}}
+    ]
+  },
+  "status": {
+    "phase": "Running",
+    "hostIP": "10.128.4.17",
+    "podIP": "10.244.3.42",
+    "podIPs": [{"ip": "10.244.3.42"}],
+    "startTime": "2026-07-19T14:22:15Z",
+    "qosClass": "Burstable",
+    "conditions": [
+      {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-07-19T14:22:18Z"},
+      {"type": "Ready", "status": "True", "lastTransitionTime": "2026-07-19T14:22:31Z"},
+      {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-07-19T14:22:31Z"},
+      {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-07-19T14:22:15Z"}
+    ],
+    "containerStatuses": [
+      {
+        "name": "checkout-api",
+        "image": "registry.internal.example.com/payments/checkout-api:2.14.3",
+        "imageID": "registry.internal.example.com/payments/checkout-api@sha256:a1b2c3d4e5f60718293a4b5c6d7e8f9012345678901234567890abcdef123456",
+        "containerID": "containerd://f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+        "ready": true,
+        "started": true,
+        "restartCount": 0,
+        "state": {"running": {"startedAt": "2026-07-19T14:22:20Z"}}
+      },
+      {
+        "name": "istio-proxy",
+        "image": "docker.io/istio/proxyv2:1.22.3",
+        "imageID": "docker.io/istio/proxyv2@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "containerID": "containerd://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+        "ready": true,
+        "started": true,
+        "restartCount": 0,
+        "state": {"running": {"startedAt": "2026-07-19T14:22:19Z"}}
+      }
+    ]
+  }
+}

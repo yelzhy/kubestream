@@ -19,21 +19,64 @@ package controller
 import (
 	"context"
 	"slices"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/yelzhy/kubestream/internal/sink"
 )
+
+// recordingSink is a logr.LogSink that captures the errors passed to
+// log.Error, so a test can assert the reconciler logged a specific anomaly
+// (Invariant 4: zero silent errors). It is concurrency-safe because a commit
+// callback can run on a different goroutine than the Reconcile call.
+type recordingSink struct {
+	mu     sync.Mutex
+	errors []error
+}
+
+func (s *recordingSink) Init(logr.RuntimeInfo)          {}
+func (s *recordingSink) Enabled(int) bool               { return true }
+func (s *recordingSink) Info(int, string, ...any)       {}
+func (s *recordingSink) WithValues(...any) logr.LogSink { return s }
+func (s *recordingSink) WithName(string) logr.LogSink   { return s }
+func (s *recordingSink) Error(err error, _ string, _ ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.errors = append(s.errors, err)
+}
+
+func (s *recordingSink) loggedErrors() []error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.errors)
+}
+
+// corruptBaseline truncates the compressed diff baseline stored for key so a
+// later decodeBaseline fails, simulating an on-disk/in-memory corruption. It
+// leaves Hash untouched so callers can independently control whether the
+// dedup short-circuit or the diff-decode path is exercised.
+func corruptBaseline(hc *hashCache, key string) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	entry := hc.data[key]
+	if len(entry.JSON) > 1 {
+		entry.JSON = entry.JSON[:len(entry.JSON)/2]
+	}
+	hc.data[key] = entry
+}
 
 // capturingWriter is a sink.Writer that records the Record of every enqueued
 // job, so the integration test can inspect exactly what Reconcile produced
@@ -102,6 +145,110 @@ var _ = Describe("ResourceStream Controller", func() {
 			var record sink.Record
 			Eventually(writer.captured, 5*time.Second).Should(Receive(&record))
 			Expect(record.Actors).To(Equal(expected))
+		})
+	})
+})
+
+var _ = Describe("ResourceStream Controller compressed baselines", func() {
+	podGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}
+
+	// newReconciler wires a reconciler around a capturing writer and a
+	// recording logger so each spec can inspect both the enqueued records and
+	// any errors the reconciler logged.
+	newReconciler := func() (*ResourceStreamReconciler, *capturingWriter, *recordingSink) {
+		writer := &capturingWriter{captured: make(chan sink.Record, 8)}
+		return &ResourceStreamReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Writer:    writer,
+			GVK:       podGVK,
+			ClusterID: "test-cluster",
+			requeueCh: make(chan event.GenericEvent, 1),
+			metrics:   PipelineMetricsInstance(),
+		}, writer, &recordingSink{}
+	}
+
+	Context("when a cached baseline is corrupt", func() {
+		It("short-circuits an unchanged object on hash alone, never decompressing", func() {
+			reconciler, writer, rec := newReconciler()
+			ctx := logf.IntoContext(context.Background(), logr.New(rec))
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "shortcircuit-pod", Namespace: "default"},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(context.Background(), pod))).To(Succeed())
+			})
+
+			req := ctrl.Request{NamespacedName: client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var first sink.Record
+			Eventually(writer.captured, 5*time.Second).Should(Receive(&first))
+			Expect(first.EventType).To(Equal("Added"))
+
+			// Corrupt the stored baseline but leave its hash intact, so the
+			// next Reconcile of the unchanged object matches on hash and must
+			// short-circuit before ever touching (and failing to decode) the
+			// baseline.
+			corruptBaseline(&reconciler.HashCache, reconciler.cacheKey(pod.Namespace, pod.Name))
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// No record and no logged error: the corrupt baseline was never
+			// decoded, proving the dedup hot path is hash-comparison-only.
+			Consistently(writer.captured, 500*time.Millisecond).ShouldNot(Receive())
+			Expect(rec.loggedErrors()).To(BeEmpty())
+		})
+
+		It("falls back to a full-state write (event not dropped) and logs the decode error when the object changed", func() {
+			reconciler, writer, rec := newReconciler()
+			ctx := logf.IntoContext(context.Background(), logr.New(rec))
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "corrupt-baseline-pod", Namespace: "default"},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(context.Background(), pod))).To(Succeed())
+			})
+
+			req := ctrl.Request{NamespacedName: client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var first sink.Record
+			Eventually(writer.captured, 5*time.Second).Should(Receive(&first))
+			Expect(first.EventType).To(Equal("Added"))
+
+			// Corrupt the baseline, then change the object so the next
+			// Reconcile takes the diff path and must decode the (now corrupt)
+			// baseline.
+			corruptBaseline(&reconciler.HashCache, reconciler.cacheKey(pod.Namespace, pod.Name))
+
+			fetched := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, req.NamespacedName, fetched)).To(Succeed())
+			fetched.Labels = map[string]string{"changed": "true"}
+			Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The event is preserved as a full-state Modified write, not
+			// dropped and not mis-recorded as a diff.
+			var second sink.Record
+			Eventually(writer.captured, 5*time.Second).Should(Receive(&second))
+			Expect(second.EventType).To(Equal("Modified"))
+			Expect(second.Data).NotTo(BeEmpty())
+			Expect(second.Diff).To(BeEmpty())
+
+			// The decode failure was logged at Error level, never swallowed.
+			Expect(rec.loggedErrors()).NotTo(BeEmpty())
 		})
 	})
 })

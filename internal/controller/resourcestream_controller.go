@@ -51,6 +51,12 @@ import (
 // this sentinel just gives Reconcile's log.Error calls a non-nil error value.
 var errAsyncWriteFailed = errors.New("clickhouse write did not succeed after retries")
 
+// errBaselineCompression is logged when compressBaseline could not compress a
+// diff baseline and fell back to storing raw bytes. It gives that Error log a
+// non-nil error value; the fallback itself is a safe degradation (Invariant
+// 5) — a raw baseline still diffs correctly, it just costs more memory.
+var errBaselineCompression = errors.New("failed to compress diff baseline, stored raw")
+
 type ResourceStreamReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -443,10 +449,18 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			}
 
 			eventType = "Modified"
+			baseline, decodeErr := cachedEntry.decodeBaseline()
 			if cachedEntry.JSON == nil {
 				log.Info("🔄 Restored after restart (Full State)", "kind", r.GVK.Kind, "name", req.Name)
 				switchToFullState()
-			} else if patch, err := jsondiff.CompareJSON(cachedEntry.JSON, objJson); err != nil {
+			} else if decodeErr != nil {
+				// A corrupt or truncated compressed baseline can't be diffed
+				// against; fall back to writing full state exactly like the
+				// missing-baseline path above, so the event is preserved
+				// (never dropped) rather than silently mis-recorded.
+				log.Error(decodeErr, "⚠️ Failed to decompress cached baseline, falling back to full state", "kind", r.GVK.Kind, "name", req.Name)
+				switchToFullState()
+			} else if patch, err := jsondiff.CompareJSON(baseline, objJson); err != nil {
 				// Not expected to be reachable today — cachedEntry.JSON and
 				// objJson are always the product of a prior successful
 				// json.Marshal — but a silently-discarded error here would
@@ -482,6 +496,18 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		log.Info("🌱 Cache not yet warmed, tagging as Snapshot", "kind", r.GVK.Kind, "name", req.Name)
 	}
 
+	// Compress the diff baseline once, up front, and reuse the same bytes for
+	// both the optimistic Reserve entry and the confirmed commit entry — the
+	// compressed copy is what makes hashCache's per-object footprint a
+	// fraction of the raw normalized JSON (Task 0.7). A compression failure
+	// degrades to storing raw bytes and is logged at Error level (Invariant
+	// 5); the diff path handles either encoding transparently via
+	// decodeBaseline.
+	baselineData, baselineEnc, compressed := compressBaseline(objJson)
+	if !compressed {
+		log.Error(errBaselineCompression, "⚠️ Storing uncompressed baseline", "kind", r.GVK.Kind, "name", req.Name)
+	}
+
 	// Reserve atomically assigns the next version for this key and stores
 	// the pending entry, so a duplicate Reconcile firing before the write is
 	// confirmed short-circuits as a no-op instead of enqueuing a second
@@ -492,9 +518,10 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// still the latest write issued for the key — otherwise a newer write
 	// has already superseded it and is left alone.
 	version := r.HashCache.Reserve(objectKey, CacheEntry{
-		Hash: hashString,
-		JSON: objJson,
-		UID:  currentUID,
+		Hash:     hashString,
+		JSON:     baselineData,
+		Encoding: baselineEnc,
+		UID:      currentUID,
 	})
 	// Reserve may have added a brand-new key; refresh the size gauge outside
 	// any cache lock (recordHashCacheEntries takes/releases it internally).
@@ -535,9 +562,10 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				// pending marker into a confirmed cache entry, unless a
 				// newer write has already superseded this one.
 				r.HashCache.CommitIfCurrent(objectKey, version, CacheEntry{
-					Hash: hashString,
-					JSON: objJson,
-					UID:  currentUID,
+					Hash:     hashString,
+					JSON:     baselineData,
+					Encoding: baselineEnc,
+					UID:      currentUID,
 				})
 				return
 			}

@@ -1,0 +1,164 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "checkout-api",
+    "namespace": "payments",
+    "uid": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+    "labels": {
+      "app.kubernetes.io/name": "checkout-api",
+      "app.kubernetes.io/instance": "checkout-api-prod",
+      "app.kubernetes.io/version": "2.14.3",
+      "app.kubernetes.io/component": "backend",
+      "app.kubernetes.io/part-of": "payments-platform",
+      "app.kubernetes.io/managed-by": "argocd",
+      "team": "payments"
+    },
+    "annotations": {
+      "deployment.kubernetes.io/revision": "17",
+      "argocd.argoproj.io/tracking-id": "checkout-api:apps/Deployment:payments/checkout-api",
+      "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"checkout-api\",\"namespace\":\"payments\"}}"
+    }
+  },
+  "spec": {
+    "replicas": 6,
+    "revisionHistoryLimit": 10,
+    "progressDeadlineSeconds": 600,
+    "selector": {
+      "matchLabels": {
+        "app.kubernetes.io/name": "checkout-api",
+        "app.kubernetes.io/instance": "checkout-api-prod"
+      }
+    },
+    "strategy": {
+      "type": "RollingUpdate",
+      "rollingUpdate": {"maxUnavailable": "25%", "maxSurge": "25%"}
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "checkout-api",
+          "app.kubernetes.io/instance": "checkout-api-prod",
+          "app.kubernetes.io/version": "2.14.3",
+          "app.kubernetes.io/component": "backend",
+          "app.kubernetes.io/part-of": "payments-platform",
+          "team": "payments",
+          "tier": "backend"
+        },
+        "annotations": {
+          "prometheus.io/scrape": "true",
+          "prometheus.io/port": "9090",
+          "prometheus.io/path": "/metrics",
+          "sidecar.istio.io/inject": "true",
+          "checksum/config": "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e"
+        }
+      },
+      "spec": {
+        "serviceAccountName": "checkout-api",
+        "terminationGracePeriodSeconds": 30,
+        "dnsPolicy": "ClusterFirst",
+        "restartPolicy": "Always",
+        "schedulerName": "default-scheduler",
+        "securityContext": {
+          "runAsUser": 1000,
+          "runAsGroup": 3000,
+          "runAsNonRoot": true,
+          "fsGroup": 2000,
+          "seccompProfile": {"type": "RuntimeDefault"}
+        },
+        "affinity": {
+          "podAntiAffinity": {
+            "preferredDuringSchedulingIgnoredDuringExecution": [
+              {
+                "weight": 100,
+                "podAffinityTerm": {
+                  "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "checkout-api"}},
+                  "topologyKey": "kubernetes.io/hostname"
+                }
+              }
+            ]
+          },
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "kubernetes.io/os", "operator": "In", "values": ["linux"]}]}
+              ]
+            }
+          }
+        },
+        "tolerations": [
+          {"key": "workload", "operator": "Equal", "value": "payments", "effect": "NoSchedule"}
+        ],
+        "containers": [
+          {
+            "name": "checkout-api",
+            "image": "registry.internal.example.com/payments/checkout-api:2.14.3",
+            "imagePullPolicy": "IfNotPresent",
+            "ports": [
+              {"name": "http", "containerPort": 8080, "protocol": "TCP"},
+              {"name": "metrics", "containerPort": 9090, "protocol": "TCP"}
+            ],
+            "env": [
+              {"name": "DATABASE_URL", "valueFrom": {"secretKeyRef": {"name": "checkout-db", "key": "url"}}},
+              {"name": "DATABASE_MAX_CONNECTIONS", "value": "25"},
+              {"name": "DATABASE_IDLE_TIMEOUT", "value": "300s"},
+              {"name": "REDIS_HOST", "value": "redis.payments.svc.cluster.local"},
+              {"name": "REDIS_PORT", "value": "6379"},
+              {"name": "REDIS_DB", "value": "0"},
+              {"name": "LOG_LEVEL", "value": "info"},
+              {"name": "LOG_FORMAT", "value": "json"},
+              {"name": "HTTP_READ_TIMEOUT", "value": "15s"},
+              {"name": "HTTP_WRITE_TIMEOUT", "value": "15s"},
+              {"name": "FEATURE_FLAG_NEW_CHECKOUT", "value": "true"},
+              {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://otel-collector.observability.svc.cluster.local:4317"},
+              {"name": "OTEL_SERVICE_NAME", "value": "checkout-api"},
+              {"name": "POD_NAME", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}},
+              {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"}}}
+            ],
+            "resources": {
+              "limits": {"cpu": "1", "memory": "512Mi"},
+              "requests": {"cpu": "250m", "memory": "256Mi"}
+            },
+            "volumeMounts": [
+              {"name": "config", "mountPath": "/etc/checkout-api", "readOnly": true},
+              {"name": "tmp", "mountPath": "/tmp"}
+            ],
+            "livenessProbe": {
+              "httpGet": {"path": "/healthz", "port": 8080, "scheme": "HTTP"},
+              "initialDelaySeconds": 15,
+              "periodSeconds": 10,
+              "timeoutSeconds": 1,
+              "successThreshold": 1,
+              "failureThreshold": 3
+            },
+            "readinessProbe": {
+              "httpGet": {"path": "/readyz", "port": 8080, "scheme": "HTTP"},
+              "initialDelaySeconds": 5,
+              "periodSeconds": 10,
+              "timeoutSeconds": 1,
+              "successThreshold": 1,
+              "failureThreshold": 3
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File"
+          }
+        ],
+        "volumes": [
+          {"name": "config", "configMap": {"name": "checkout-api-config", "defaultMode": 420}},
+          {"name": "tmp", "emptyDir": {}}
+        ]
+      }
+    }
+  },
+  "status": {
+    "observedGeneration": 17,
+    "replicas": 6,
+    "updatedReplicas": 6,
+    "readyReplicas": 6,
+    "availableReplicas": 6,
+    "conditions": [
+      {"type": "Available", "status": "True", "lastUpdateTime": "2026-07-19T14:23:01Z", "lastTransitionTime": "2026-06-02T09:11:44Z", "reason": "MinimumReplicasAvailable", "message": "Deployment has minimum availability."},
+      {"type": "Progressing", "status": "True", "lastUpdateTime": "2026-07-19T14:23:05Z", "lastTransitionTime": "2026-06-02T09:11:40Z", "reason": "NewReplicaSetAvailable", "message": "ReplicaSet \"checkout-api-7d9f8c6b54\" has successfully progressed."}
+    ]
+  }
+}
