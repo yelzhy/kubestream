@@ -39,22 +39,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	"github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/go-logr/logr"
 	"github.com/wI2L/jsondiff"
+
+	"github.com/yelzhy/kubestream/internal/sink"
 )
 
-// errAsyncWriteFailed is logged when a CHWriter job exhausts its retries.
-// The actual driver error is already logged inside CHWriter.process; this
-// sentinel just gives Reconcile's log.Error calls a non-nil error value.
+// errAsyncWriteFailed is logged when a sink write exhausts its retries.
+// The actual driver error is already logged inside the sink implementation;
+// this sentinel just gives Reconcile's log.Error calls a non-nil error value.
 var errAsyncWriteFailed = errors.New("clickhouse write did not succeed after retries")
 
 type ResourceStreamReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	CHWriter  *CHWriter
+	Scheme *runtime.Scheme
+	// Writer is the sink this reconciler hands records off to. It is the
+	// backend-agnostic contract (internal/sink), so the reconciler never
+	// depends on ClickHouse directly.
+	Writer    sink.Writer
 	HashCache hashCache
 	GVK       schema.GroupVersionKind
 	// ClusterID identifies this operator's cluster in every ClickHouse row
@@ -83,33 +86,33 @@ type ResourceStreamReconciler struct {
 
 	// metrics records dedup short-circuits, hashCache size, per-kind SafeMode,
 	// and dropped requeue triggers. Never nil once set in SetupWithManager.
-	metrics *pipelineMetrics
+	metrics *PipelineMetrics
 }
 
 // closeOutRetryQueue is a mutex-protected map from cacheKey to the
-// ResourceRecords still awaiting a successful close-out write for that key.
+// sink.Records still awaiting a successful close-out write for that key.
 // A slice, not a single record, because a second reincarnation could in
 // principle occur for the same name before the first close-out resolves;
 // this way that (rare) case queues up rather than one write silently
 // replacing tracking of the other.
 type closeOutRetryQueue struct {
 	mu   sync.Mutex
-	data map[string][]ResourceRecord
+	data map[string][]sink.Record
 }
 
 // Add appends record to key's pending list, to be retried on a later call to
 // TakeAll for the same key.
-func (q *closeOutRetryQueue) Add(key string, record ResourceRecord) {
+func (q *closeOutRetryQueue) Add(key string, record sink.Record) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.data == nil {
-		q.data = make(map[string][]ResourceRecord)
+		q.data = make(map[string][]sink.Record)
 	}
 	q.data[key] = append(q.data[key], record)
 }
 
 // TakeAll returns and clears key's pending records, if any.
-func (q *closeOutRetryQueue) TakeAll(key string) []ResourceRecord {
+func (q *closeOutRetryQueue) TakeAll(key string) []sink.Record {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	records := q.data[key]
@@ -208,7 +211,7 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 	// A Deleted row carries empty data, diff, and sha256: event_type alone
 	// carries deletion semantics in schema v1 (see docs/SCHEMA.md), replacing
 	// the pre-v1 data/sha256 deletion sentinels.
-	record := ResourceRecord{
+	record := sink.Record{
 		Timestamp:  time.Now().UTC(),
 		ClusterID:  r.ClusterID,
 		EventType:  "Deleted",
@@ -227,10 +230,9 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 	// release from a superseded claim (e.g. the object was recreated under a
 	// new UID while this write was in flight) is a safe no-op — see
 	// UnclaimDelete.
-	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
-		query: insertResourceStateQuery,
-		args:  record.insertArgs(),
-		commit: func(ok bool) {
+	enqueueErr := r.Writer.Enqueue(ctx, sink.Job{
+		Record: record,
+		Commit: func(ok bool) {
 			if ok {
 				r.HashCache.DeleteIfCurrent(objectKey, version)
 				r.recordHashCacheEntries()
@@ -262,11 +264,10 @@ func (r *ResourceStreamReconciler) emitDelete(ctx context.Context, log logr.Logg
 // getting retried instead of the historical record silently vanishing.
 //
 //nolint:logcheck
-func (r *ResourceStreamReconciler) enqueueCloseOut(ctx context.Context, log logr.Logger, objectKey string, record ResourceRecord) {
-	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
-		query: insertResourceStateQuery,
-		args:  record.insertArgs(),
-		commit: func(ok bool) {
+func (r *ResourceStreamReconciler) enqueueCloseOut(ctx context.Context, log logr.Logger, objectKey string, record sink.Record) {
+	enqueueErr := r.Writer.Enqueue(ctx, sink.Job{
+		Record: record,
+		Commit: func(ok bool) {
 			if ok {
 				return
 			}
@@ -396,7 +397,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			if claimedEntry, _, claimed := r.HashCache.ReserveDelete(objectKey, cachedEntry.UID); claimed {
 				// Deleted rows carry empty data/diff/sha256 in schema v1 —
 				// event_type alone marks the deletion (see docs/SCHEMA.md).
-				closeRecord := ResourceRecord{
+				closeRecord := sink.Record{
 					Timestamp:  time.Now().UTC(),
 					ClusterID:  r.ClusterID,
 					EventType:  "Deleted",
@@ -507,7 +508,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	record := ResourceRecord{
+	record := sink.Record{
 		Timestamp:       time.Now().UTC(),
 		ClusterID:       r.ClusterID,
 		EventType:       eventType,
@@ -526,10 +527,9 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// --- EXPORT BLOCK ---
-	enqueueErr := r.CHWriter.Enqueue(ctx, 0, writeJob{
-		query: insertResourceStateQuery,
-		args:  record.insertArgs(),
-		commit: func(ok bool) {
+	enqueueErr := r.Writer.Enqueue(ctx, sink.Job{
+		Record: record,
+		Commit: func(ok bool) {
 			if ok {
 				// Only now is the write durably confirmed — settle the
 				// pending marker into a confirmed cache entry, unless a
@@ -562,60 +562,7 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
-func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig ClickHouseConfig, reconcilerConfig ReconcilerConfig) error {
-	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{chConfig.Addr},
-		Auth: clickhouse.Auth{
-			Database: chConfig.Database,
-			Username: chConfig.Username,
-			Password: chConfig.Password,
-		},
-		Protocol:    clickhouse.Native,
-		DialTimeout: chConfig.DialTimeout,
-		ReadTimeout: chConfig.ReadTimeout,
-	})
-	if err != nil {
-		return err
-	}
-
-	// CHWriter decouples every ClickHouse insert from the Reconcile hot path
-	// (see chwriter.go). One instance is shared across all watched GVKs; its
-	// lifecycle — including closing conn on shutdown — is tied to the
-	// manager's via mgr.Add. insertTimeout is chConfig.ReadTimeout, so the
-	// operator-configured value actually governs the async write path (not
-	// just the connection's own driver-level timeout).
-	chWriter := NewCHWriter(conn, 0, 0, chConfig.ReadTimeout, 0, 0)
-
-	// connUsers tracks goroutines besides CHWriter's own workers that still
-	// need conn (namely restoreAndWarm, below) — CHWriter waits for this to
-	// drain before closing conn, so shutdown can never race a use of the
-	// shared connection against its closure.
-	var connUsers sync.WaitGroup
-	chWriter.WaitForOthers(&connUsers)
-
-	if err := mgr.Add(chWriter); err != nil {
-		return err
-	}
-
-	// Connect-time schema validation. A dedicated readyz check degrades
-	// readiness if the live tables drift from schema v1 (see schema.go), and a
-	// background runnable does the actual introspection so mgr.Start is never
-	// gated on ClickHouse being reachable at boot. It shares conn, so it is
-	// tracked in connUsers exactly like restoreAndWarm — CHWriter waits for
-	// that group before closing conn on shutdown.
-	schemaGate := newSchemaGate()
-	if err := mgr.AddReadyzCheck("clickhouse-schema", schemaGate.readyCheck); err != nil {
-		return err
-	}
-	connUsers.Add(1)
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		defer connUsers.Done()
-		validateSchemaWithRetry(ctx, conn, chConfig.Database, chConfig.AutoCreateSchema, schemaGate, logf.Log.WithName("schema"))
-		return nil
-	})); err != nil {
-		return err
-	}
-
+func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, writer sink.Writer, reader sink.StateReader, reconcilerConfig ReconcilerConfig) error {
 	// gvksToWatch comes from ReconcilerConfig (sourced from WATCHED_GVKS /
 	// --watched-gvks in cmd/main.go) rather than a hardcoded slice, so
 	// watching a new resource type — including a CRD — is a config change,
@@ -639,21 +586,19 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 		reconciler := &ResourceStreamReconciler{
 			Client:    mgr.GetClient(),
 			Scheme:    mgr.GetScheme(),
-			CHWriter:  chWriter,
+			Writer:    writer,
 			GVK:       gvk,
 			ClusterID: reconcilerConfig.ClusterID,
 			requeueCh: requeueCh,
-			metrics:   pipelineMetricsInstance(),
+			metrics:   PipelineMetricsInstance(),
 		}
 		// The cache starts empty and isn't trustworthy until restoreAndWarm
 		// (below) finishes — see the SafeMode field doc and Reconcile.
 		reconciler.SafeMode.Store(true)
 		reconciler.metrics.safeMode.WithLabelValues(gvk.Kind).Set(1)
 
-		connUsers.Add(1)
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			defer connUsers.Done()
-			restoreAndWarm(ctx, mgr, conn, reconciler, gvk, log)
+			restoreAndWarm(ctx, mgr, reader, reconciler, gvk, log)
 			return nil
 		})); err != nil {
 			return err
@@ -675,21 +620,21 @@ func (r *ResourceStreamReconciler) SetupWithManager(mgr ctrl.Manager, chConfig C
 	return nil
 }
 
-// restoreAndWarm rebuilds a single GVK's HashCache from ClickHouse history in
+// restoreAndWarm rebuilds a single GVK's HashCache from the sink's history in
 // the background, then runs the zombie-object GC pass. Running this as a
 // manager.Runnable (rather than inline in SetupWithManager) means mgr.Start()
-// is never gated on ClickHouse being reachable at boot.
+// is never gated on the sink being reachable at boot.
 //
-// The restore query is retried indefinitely (bounded backoff, no elapsed-time
+// The restore is retried indefinitely (bounded backoff, no elapsed-time
 // cutoff) until it succeeds or ctx is cancelled by manager shutdown. While it
 // hasn't yet succeeded, reconciler.SafeMode stays true, so Reconcile tags
-// cache-miss events "Snapshot" instead of "Added" — a ClickHouse outage at
-// startup degrades to that instead of re-emitting every live object in the
-// cluster as a duplicate "Added" row.
+// cache-miss events "Snapshot" instead of "Added" — a sink outage at startup
+// degrades to that instead of re-emitting every live object in the cluster as
+// a duplicate "Added" row.
 //
 //nolint:logcheck
-func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, reconciler *ResourceStreamReconciler, gvk schema.GroupVersionKind, log logr.Logger) {
-	log.Info("🔄 Warming cache from ClickHouse history...", "kind", gvk.Kind)
+func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, reader sink.StateReader, reconciler *ResourceStreamReconciler, gvk schema.GroupVersionKind, log logr.Logger) {
+	log.Info("🔄 Warming cache from sink history...", "kind", gvk.Kind)
 
 	type gcTarget struct {
 		Namespace string
@@ -701,54 +646,38 @@ func restoreAndWarm(ctx context.Context, mgr ctrl.Manager, conn driver.Conn, rec
 	warm := func() error {
 		targetsToCheck = nil
 
-		// Filtering on api_group as well as kind keeps two different resources
+		// The scope is GVK-wide (empty Namespace): (cluster_id, api_group, kind)
+		// is the version-agnostic identity the in-process cacheKey builder keys
+		// on, and LastKnownStates mirrors it on the sink side so two resources
 		// that share a Kind (e.g. batch/v1 Job vs. a CRD example.com/v1 Job)
-		// from cross-contaminating each other's warm-up history — the schema-v1
-		// identity is (cluster_id, api_group, kind, namespace, name). This is
-		// the ClickHouse-side mirror of the in-process cacheKey builder, which
-		// keys on (api_group, kind, namespace, name) for the same reason.
-		rows, err := conn.Query(ctx, `
-            SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts)
-            FROM resource_states
-            WHERE api_group = ? AND kind = ? AND cluster_id = ?
-            GROUP BY namespace, name
-            HAVING argMax(event_type, ts) != 'Deleted'
-        `, gvk.Group, gvk.Kind, reconciler.ClusterID)
+		// never cross-contaminate each other's warm-up history. A transient
+		// backend error (or a partial read) is returned so backoff.Retry tries
+		// again from scratch rather than clearing SafeMode with an under-
+		// restored cache.
+		states, err := reader.LastKnownStates(ctx, sink.ScopeFilter{
+			ClusterID: reconciler.ClusterID,
+			APIGroup:  gvk.Group,
+			Kind:      gvk.Kind,
+		})
 		if err != nil {
 			return err
 		}
-		defer func() { _ = rows.Close() }()
 
-		restoredCount := 0
-		for rows.Next() {
-			var namespace, name, uid, hash string
-			if err := rows.Scan(&namespace, &name, &uid, &hash); err != nil {
-				return err
-			}
-			key := reconciler.cacheKey(namespace, name)
+		for _, st := range states {
+			key := reconciler.cacheKey(st.Namespace, st.Name)
 
 			// StoreIfAbsent, not Store: a live Reconcile may already have
 			// reserved a newer entry for this key while SafeMode was still
 			// true (tagged "Snapshot") — that live state is authoritative
 			// and must not be clobbered by this historical baseline.
 			reconciler.HashCache.StoreIfAbsent(key, CacheEntry{
-				Hash: hash,
+				Hash: st.SHA256,
 				JSON: nil,
-				UID:  uid,
+				UID:  st.UID,
 			})
-			restoredCount++
-			targetsToCheck = append(targetsToCheck, gcTarget{Namespace: namespace, Name: name, UID: uid})
+			targetsToCheck = append(targetsToCheck, gcTarget{Namespace: st.Namespace, Name: st.Name, UID: st.UID})
 		}
-		// A mid-stream failure (e.g. the connection dropping) makes rows.Next()
-		// return false exactly like a clean EOF — only rows.Err() distinguishes
-		// the two. Treating a partial result as success here would clear
-		// SafeMode having silently under-restored the cache, so a scan error
-		// (above) or a stream error (here) must both fail the whole attempt
-		// and let backoff.Retry try again from scratch.
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		log.Info("✅ Cache warmed", "kind", gvk.Kind, "objects_loaded", restoredCount)
+		log.Info("✅ Cache warmed", "kind", gvk.Kind, "objects_loaded", len(states))
 		return nil
 	}
 

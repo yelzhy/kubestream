@@ -5,6 +5,7 @@ linters:
   default: none
   enable:
     - copyloopvar
+    - depguard
     - dupl
     - errcheck
     - ginkgolinter
@@ -24,6 +25,18 @@ linters:
     - unused
     - logcheck
   settings:
+    depguard:
+      rules:
+        # Task 0.5 acceptance criterion: internal/controller must depend on the
+        # generic sink contract (internal/sink), never on the ClickHouse driver
+        # directly. This rule fails the build if that dependency ever creeps
+        # back in — in source or test files under internal/controller.
+        controller-no-clickhouse:
+          files:
+            - "**/internal/controller/**"
+          deny:
+            - pkg: github.com/ClickHouse/clickhouse-go/v2
+              desc: "internal/controller must depend on internal/sink, not the ClickHouse driver (Task 0.5)"
     custom:
       logcheck:
         type: "module"

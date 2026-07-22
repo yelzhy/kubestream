@@ -16,7 +16,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+package clickhouse
 
 import (
 	"context"
@@ -24,7 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ClickHouse/clickhouse-go/v2"
+	chdriver "github.com/ClickHouse/clickhouse-go/v2"
+
+	"github.com/yelzhy/kubestream/internal/sink"
 )
 
 // TestSchemaRoundTripIntegration proves a real ClickHouse round-trip on the
@@ -41,10 +43,10 @@ func TestSchemaRoundTripIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	conn, err := clickhouse.Open(&clickhouse.Options{
+	conn, err := chdriver.Open(&chdriver.Options{
 		Addr:        []string{addr},
-		Auth:        clickhouse.Auth{Database: database, Username: username, Password: password},
-		Protocol:    clickhouse.Native,
+		Auth:        chdriver.Auth{Database: database, Username: username, Password: password},
+		Protocol:    chdriver.Native,
 		DialTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second,
 	})
@@ -74,7 +76,7 @@ func TestSchemaRoundTripIntegration(t *testing.T) {
 	}
 
 	// 3. Insert one row via the exact writer query and positional args.
-	rec := ResourceRecord{
+	rec := sink.Record{
 		Timestamp:       time.Now().UTC(),
 		ClusterID:       "it-cluster",
 		EventType:       "Added",
@@ -89,7 +91,7 @@ func TestSchemaRoundTripIntegration(t *testing.T) {
 		Data:            `{"kind":"Deployment"}`,
 		SHA256:          "abc123",
 	}
-	if err := conn.Exec(ctx, insertResourceStateQuery, rec.insertArgs()...); err != nil {
+	if err := conn.Exec(ctx, insertResourceStateQuery, insertArgs(rec)...); err != nil {
 		t.Fatalf("insert row: %v", err)
 	}
 

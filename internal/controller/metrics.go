@@ -28,20 +28,26 @@ import (
 // controller-runtime already serves via --metrics-bind-address.
 const metricsNamespace = "kubestream"
 
-// pipelineMetrics is the full set of Prometheus collectors describing the
+// PipelineMetrics is the full set of Prometheus collectors describing the
 // write pipeline's health: queue saturation, write outcomes and latency,
 // retry storms, dedup short-circuits, cache size, per-kind Snapshot (safe)
 // mode, and dropped requeue triggers. Before this, all of those were only
 // visible in logs; every later performance task (0.6, 0.8, 2.3) needs them to
 // prove it actually helped.
 //
+// It is exported because the ClickHouse writer (internal/sink/clickhouse)
+// records the write-path metrics through the narrow clickhouse.Metrics
+// interface, which *PipelineMetrics satisfies (see the setter methods below).
+// The collector fields stay unexported: callers mutate them only through those
+// methods or through this package's own reconciler code.
+//
 // Collectors are grouped in a struct (rather than package-level vars) so tests
 // can build an isolated instance against a fresh registry — Prometheus panics
 // on duplicate registration, so a package-level singleton alone would make
 // repeated test setups fatal. Production code uses exactly one instance,
 // registered once on controller-runtime's global registry (see
-// pipelineMetricsInstance).
-type pipelineMetrics struct {
+// PipelineMetricsInstance).
+type PipelineMetrics struct {
 	// writeQueueDepth / writeQueueCapacity together show how close the
 	// CHWriter's bounded hand-off queue is to saturation — the earliest
 	// warning that ClickHouse can't keep up with the reconcile rate.
@@ -82,13 +88,13 @@ type pipelineMetrics struct {
 	requeueDrops prometheus.Counter
 }
 
-// newPipelineMetrics constructs every collector and registers it on reg.
+// NewPipelineMetrics constructs every collector and registers it on reg.
 // Registration uses MustRegister, so passing a registry that already holds
 // these names panics — that is intentional: production passes the global
-// registry exactly once (guarded by sync.Once in pipelineMetricsInstance),
+// registry exactly once (guarded by sync.Once in PipelineMetricsInstance),
 // and each test passes its own fresh registry.
-func newPipelineMetrics(reg prometheus.Registerer) *pipelineMetrics {
-	m := &pipelineMetrics{
+func NewPipelineMetrics(reg prometheus.Registerer) *PipelineMetrics {
+	m := &PipelineMetrics{
 		writeQueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Name:      "write_queue_depth",
@@ -172,17 +178,42 @@ func newPipelineMetrics(reg prometheus.Registerer) *pipelineMetrics {
 
 var (
 	pipelineMetricsOnce      sync.Once
-	pipelineMetricsSingleton *pipelineMetrics
+	pipelineMetricsSingleton *PipelineMetrics
 )
 
-// pipelineMetricsInstance returns the process-wide pipelineMetrics, registered
+// PipelineMetricsInstance returns the process-wide PipelineMetrics, registered
 // exactly once on controller-runtime's global registry so the existing
 // --metrics-bind-address server exposes them. The sync.Once guard makes
-// repeated calls (e.g. one CHWriter plus several reconcilers all fetching it)
-// safe and non-duplicating.
-func pipelineMetricsInstance() *pipelineMetrics {
+// repeated calls (e.g. the ClickHouse writer plus several reconcilers all
+// fetching it) safe and non-duplicating.
+func PipelineMetricsInstance() *PipelineMetrics {
 	pipelineMetricsOnce.Do(func() {
-		pipelineMetricsSingleton = newPipelineMetrics(ctrlmetrics.Registry)
+		pipelineMetricsSingleton = NewPipelineMetrics(ctrlmetrics.Registry)
 	})
 	return pipelineMetricsSingleton
 }
+
+// The methods below implement the clickhouse.Metrics interface: the write-path
+// slice of these collectors, exposed as behavior rather than raw fields so the
+// clickhouse package depends on a narrow contract and never imports this one.
+
+// SetWriteQueueDepth publishes the current CHWriter hand-off queue depth.
+func (m *PipelineMetrics) SetWriteQueueDepth(n float64) { m.writeQueueDepth.Set(n) }
+
+// SetWriteQueueCapacity publishes the fixed CHWriter hand-off queue capacity.
+func (m *PipelineMetrics) SetWriteQueueCapacity(n float64) { m.writeQueueCapacity.Set(n) }
+
+// ObserveEnqueueBlock records how long an Enqueue blocked waiting for room.
+func (m *PipelineMetrics) ObserveEnqueueBlock(seconds float64) { m.enqueueBlock.Observe(seconds) }
+
+// IncEnqueueTimeout counts an Enqueue that gave up because the queue stayed full.
+func (m *PipelineMetrics) IncEnqueueTimeout() { m.enqueueTimeouts.Inc() }
+
+// ObserveWriteLatency records a job's first-attempt-to-final-settle latency.
+func (m *PipelineMetrics) ObserveWriteLatency(seconds float64) { m.writeLatency.Observe(seconds) }
+
+// IncWriteRetryAttempt counts one write attempt beyond the first.
+func (m *PipelineMetrics) IncWriteRetryAttempt() { m.writeRetryAttempts.Inc() }
+
+// IncWrite counts one settled write by outcome ("success" | "failed").
+func (m *PipelineMetrics) IncWrite(outcome string) { m.writesTotal.WithLabelValues(outcome).Inc() }

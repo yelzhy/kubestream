@@ -24,7 +24,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -32,48 +31,51 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/yelzhy/kubestream/internal/sink"
 )
 
-// capturingConn is a driver.Conn that records the positional args of every
-// Exec, so the integration test can inspect exactly what Reconcile enqueued for
-// ClickHouse without a real database. Embedding the interface satisfies the
-// full method set; only Exec and Close are exercised.
-type capturingConn struct {
-	driver.Conn
-	captured chan []any
+// capturingWriter is a sink.Writer that records the Record of every enqueued
+// job, so the integration test can inspect exactly what Reconcile produced
+// without a real sink. It settles each job immediately as a success so the
+// reconciler's version-gated cache commit fires just as it would in production.
+type capturingWriter struct {
+	captured chan sink.Record
 }
 
-func (c *capturingConn) Exec(_ context.Context, _ string, args ...any) error {
-	c.captured <- args
+func (w *capturingWriter) Start(ctx context.Context) error {
+	<-ctx.Done()
 	return nil
 }
 
-func (c *capturingConn) Close() error { return nil }
+func (w *capturingWriter) Enqueue(_ context.Context, job sink.Job) error {
+	w.captured <- job.Record
+	if job.Commit != nil {
+		job.Commit(true)
+	}
+	return nil
+}
 
 var _ = Describe("ResourceStream Controller", func() {
 	Context("When reconciling a resource with managedFields", func() {
 		It("enqueues a record whose actors match the applied object's field managers", func() {
 			podGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}
 
-			// A capturing conn stands in for ClickHouse so we can read back the
-			// exact insert args Reconcile produced. The CHWriter runs under a
-			// local context cancelled at the end of this spec.
-			conn := &capturingConn{captured: make(chan []any, 8)}
-			chWriter := NewCHWriter(conn, 8, 1, time.Second, time.Second, time.Second)
+			// A capturing writer stands in for the sink so we can read back the
+			// exact record Reconcile produced.
+			writer := &capturingWriter{captured: make(chan sink.Record, 8)}
 
-			writerCtx, cancelWriter := context.WithCancel(context.Background())
-			defer cancelWriter()
-			writerDone := make(chan error, 1)
-			go func() { writerDone <- chWriter.Start(writerCtx) }()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
 			reconciler := &ResourceStreamReconciler{
 				Client:    k8sClient,
 				Scheme:    k8sClient.Scheme(),
-				CHWriter:  chWriter,
+				Writer:    writer,
 				GVK:       podGVK,
 				ClusterID: "test-cluster",
 				requeueCh: make(chan event.GenericEvent, 1),
-				metrics:   pipelineMetricsInstance(),
+				metrics:   PipelineMetricsInstance(),
 			}
 
 			pod := &corev1.Pod{
@@ -82,31 +84,24 @@ var _ = Describe("ResourceStream Controller", func() {
 					Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
 				},
 			}
-			Expect(k8sClient.Create(writerCtx, pod)).To(Succeed())
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 			DeferCleanup(func() {
 				Expect(client.IgnoreNotFound(k8sClient.Delete(context.Background(), pod))).To(Succeed())
 			})
 
 			// The manager set the API server actually attributed to this create
 			// is the ground truth the enqueued record's actors must equal.
-			expected := appliedObjectManagers(writerCtx, podGVK, pod.Namespace, pod.Name)
+			expected := appliedObjectManagers(ctx, podGVK, pod.Namespace, pod.Name)
 			Expect(expected).NotTo(BeEmpty())
 
-			_, err := reconciler.Reconcile(writerCtx, ctrl.Request{
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
 				NamespacedName: client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			var args []any
-			Eventually(conn.captured, 5*time.Second).Should(Receive(&args))
-
-			// insertArgs column order puts actors at index 11 (ts, cluster_id,
-			// event_type, api_group, api_version, kind, namespace, name, uid,
-			// resource_version, labels, actors, data, diff, sha256).
-			Expect(args).To(HaveLen(15))
-			actors, ok := args[11].([]string)
-			Expect(ok).To(BeTrue(), "actors arg should be a []string")
-			Expect(actors).To(Equal(expected))
+			var record sink.Record
+			Eventually(writer.captured, 5*time.Second).Should(Receive(&record))
+			Expect(record.Actors).To(Equal(expected))
 		})
 	})
 })

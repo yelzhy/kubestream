@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/yelzhy/kubestream/internal/controller"
+	"github.com/yelzhy/kubestream/internal/sink/clickhouse"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -336,7 +337,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	chConfig := controller.ClickHouseConfig{
+	chConfig := clickhouse.Config{
 		Addr:             chAddr,
 		Database:         chDatabase,
 		Username:         chUsername,
@@ -366,10 +367,26 @@ func main() {
 		WatchedGVKs:             watchedGVKs,
 	}
 
+	// The ClickHouse backend owns the shared connection and implements both the
+	// sink.Writer (batched inserts off the Reconcile hot path) and
+	// sink.StateReader (cache warm-up) contracts; RegisterWithManager wires its
+	// writer runnable, the connect-time schema-validation runnable, and the
+	// schema readyz check into the manager. The reconciler then depends only on
+	// the sink interfaces, never on ClickHouse directly.
+	chWriter, err := clickhouse.Open(chConfig, controller.PipelineMetricsInstance())
+	if err != nil {
+		setupLog.Error(err, "Failed to open ClickHouse connection")
+		os.Exit(1)
+	}
+	if err := chWriter.RegisterWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register ClickHouse backend with manager")
+		os.Exit(1)
+	}
+
 	if err := (&controller.ResourceStreamReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr, chConfig, reconcilerConfig); err != nil {
+	}).SetupWithManager(mgr, chWriter, chWriter, reconcilerConfig); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcestream")
 		os.Exit(1)
 	}
