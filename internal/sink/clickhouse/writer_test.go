@@ -211,7 +211,7 @@ func TestBatchFlushBoundsSendCalls(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := controller.NewPipelineMetrics(reg)
 	// Large batchMaxWait so only row-count and drain drive flushes, never the timer.
-	w := NewCHWriter(conn, jobs, workers, batchMaxRows, 5*time.Millisecond, time.Second, time.Second, 30*time.Second, m)
+	w := NewCHWriter(conn, jobs, workers, batchMaxRows, 5*time.Millisecond, time.Second, time.Second, 30*time.Second, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -261,7 +261,7 @@ func TestPoisonRowIsolation(t *testing.T) {
 	m := controller.NewPipelineMetrics(reg)
 	// One worker so all ten jobs land in one batch; tiny retry cap so the batch
 	// exhausts quickly; large batchMaxWait so row-count (not the timer) flushes.
-	w := NewCHWriter(conn, 100, 1, batchMaxRows, 5*time.Millisecond, 20*time.Millisecond, time.Second, 30*time.Second, m)
+	w := NewCHWriter(conn, 100, 1, batchMaxRows, 5*time.Millisecond, 20*time.Millisecond, time.Second, 30*time.Second, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -306,7 +306,7 @@ func TestLoneJobFlushesOnWait(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := controller.NewPipelineMetrics(reg)
 	// batchMaxRows well above 1 so only the wait timer can flush the lone job.
-	w := NewCHWriter(conn, 100, 1, 100, 5*time.Millisecond, time.Second, time.Second, batchMaxWait, m)
+	w := NewCHWriter(conn, 100, 1, 100, 5*time.Millisecond, time.Second, time.Second, batchMaxWait, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -346,7 +346,7 @@ func TestShutdownFlushesPartialBatch(t *testing.T) {
 	m := controller.NewPipelineMetrics(reg)
 	// One worker, batchMaxRows=10, large batchMaxWait: the 5 jobs never reach a
 	// row-count or timer flush, so only the drain can flush them.
-	w := NewCHWriter(conn, 100, 1, 10, 5*time.Millisecond, time.Second, time.Second, 30*time.Second, m)
+	w := NewCHWriter(conn, 100, 1, 10, 5*time.Millisecond, time.Second, time.Second, 30*time.Second, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -389,7 +389,7 @@ func TestConcurrentEnqueueStorm(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := controller.NewPipelineMetrics(reg)
-	w := NewCHWriter(conn, jobs, 4, 10, 5*time.Millisecond, time.Second, time.Second, 20*time.Millisecond, m)
+	w := NewCHWriter(conn, jobs, 4, 10, 5*time.Millisecond, time.Second, time.Second, 20*time.Millisecond, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -437,7 +437,7 @@ func TestCancelMidBatchCommitsOnce(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := controller.NewPipelineMetrics(reg)
-	w := NewCHWriter(conn, 100, 1, batchMaxRows, time.Second, time.Second, time.Second, 30*time.Second, m)
+	w := NewCHWriter(conn, 100, 1, batchMaxRows, time.Second, time.Second, time.Second, 30*time.Second, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -480,7 +480,7 @@ func TestWritesTotalFailedIncrements(t *testing.T) {
 
 	// Tiny per-attempt timeout and retry cap so the job exhausts retries and
 	// settles quickly; small batchMaxWait so the lone job flushes on the timer.
-	w := NewCHWriter(erroringConn{}, 10, 1, 10, 5*time.Millisecond, 20*time.Millisecond, time.Second, 20*time.Millisecond, m)
+	w := NewCHWriter(erroringConn{}, 10, 1, 10, 5*time.Millisecond, 20*time.Millisecond, time.Second, 20*time.Millisecond, time.Second, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

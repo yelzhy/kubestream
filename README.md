@@ -93,6 +93,12 @@ Every setting is available as both a CLI flag and an environment variable (flag 
 | `--ch-auto-create-schema` | `CH_AUTO_CREATE_SCHEMA` | `false` | Execute the shipped DDL (`deploy/clickhouse/schema`) idempotently at connect time. Off by default — the operator never mutates ClickHouse DDL unless asked. |
 | `--cluster-id` | `CLUSTER_ID` | `local-kind-cluster` | Identifier for this cluster, recorded on every row. |
 | `--reconciler-max-concurrent` | `RECONCILER_MAX_CONCURRENT` | `5` | Max concurrent `Reconcile` calls per watched resource type. |
+| `--writer-queue-size` | `WRITER_QUEUE_SIZE` | `5000` | Capacity (jobs) of the async write hand-off queue. |
+| `--writer-workers` | `WRITER_WORKERS` | `4` | Number of workers draining the write queue into ClickHouse. |
+| `--writer-batch-max-rows` | `WRITER_BATCH_MAX_ROWS` | `1000` | Row count at which a worker flushes its accumulated insert batch. |
+| `--writer-batch-max-wait` | `WRITER_BATCH_MAX_WAIT` | `1s` | Max time a batch's first job waits for the batch to fill before flushing regardless. |
+| `--writer-enqueue-timeout` | `WRITER_ENQUEUE_TIMEOUT` | `2s` | How long `Enqueue` waits for queue room before returning an error (the job is never dropped silently). |
+| `--writer-drain-timeout` | `WRITER_DRAIN_TIMEOUT` | `15s` | Time budget for draining queued writes to ClickHouse during graceful shutdown. |
 | `--watched-gvks` | `WATCHED_GVKS` | `v1/Pod,apps/v1/Deployment,v1/Service` | Comma-separated list of resource types to watch, as `version/kind` or `group/version/kind`. Adding a type outside the default RBAC grant requires extending `config/rbac/role.yaml`. |
 | `--metrics-bind-address` | — | `0` (disabled) | Metrics endpoint bind address; `:8443` for HTTPS, `:8080` for HTTP. |
 | `--metrics-secure` | — | `true` | Serve the metrics endpoint over HTTPS. |
@@ -102,7 +108,7 @@ Every setting is available as both a CLI flag and an environment variable (flag 
 | `--metrics-cert-path` / `--metrics-cert-name` / `--metrics-cert-key` | — | *(empty)* / `tls.crt` / `tls.key` | Metrics server TLS certificate. |
 | `--enable-http2` | — | `false` | Enable HTTP/2 on the metrics/webhook servers (disabled by default due to known CVEs). |
 
-`CHWriter`'s queue size, worker count, per-attempt retry backoff cap, and shutdown drain timeout currently default internally (queue: 5000 jobs, workers: 4, max retry backoff: 60s, shutdown drain: 15s) and are not yet exposed as flags/env vars.
+`CHWriter`'s queue size, worker count, batching knobs, enqueue timeout, and shutdown drain timeout are configurable via the `--writer-*` flags above (D2: operators must be able to size the write path per environment). The per-attempt retry backoff cap (60s) remains an internal default. Use `make bench-load` to measure the effect of a given tuning against a dockerized ClickHouse (see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)).
 
 Standard `controller-runtime`/Zap logging flags (`--zap-devel`, `--zap-encoder`, `--zap-log-level`, `--zap-stacktrace-level`, `--zap-time-encoding`) are also available; run the binary with `--help` for the full, exact list.
 

@@ -123,6 +123,63 @@ func getEnvBoolOrDefault(key string, def bool) bool {
 	return b
 }
 
+// writerTuning holds the async-write-path knobs D2 requires operators to size
+// per environment: queue capacity, worker count, the two client-side batching
+// knobs, the enqueue backpressure timeout, and the shutdown drain budget. It is
+// a distinct struct (rather than fields sprinkled through main) so
+// registerWriterFlags can be exercised in isolation by cmd/main_test.go.
+type writerTuning struct {
+	queueSize      int
+	workers        int
+	batchMaxRows   int
+	batchMaxWait   time.Duration
+	enqueueTimeout time.Duration
+	drainTimeout   time.Duration
+}
+
+// registerWriterFlags registers the six --writer-* flags (and their WRITER_*
+// env twins) on fs and returns the struct they bind into, following the same
+// getEnvOrDefault flag/env dual-sourcing pattern as every other setting: a flag
+// wins if given, otherwise the env var, otherwise the shipped default. The
+// defaults are the exported clickhouse.Default* constants, so the operator's
+// out-of-the-box behavior, its --help text, and NewCHWriter's zero-value
+// fallback can never drift apart. An unparsable env value falls back to the
+// default with the existing stderr warning (see getEnvIntOrDefault).
+//
+// Split out of main() so cmd/main_test.go can drive it against a fresh
+// flag.FlagSet and assert flag parsing, env fallback, and invalid-value
+// degradation without touching the global flag.CommandLine.
+func registerWriterFlags(fs *flag.FlagSet) *writerTuning {
+	// Resolve each env-twin default first so the flag registrations below stay
+	// within the line-length limit and read as a clean flag/default/help table.
+	var (
+		queueSizeDef      = getEnvIntOrDefault("WRITER_QUEUE_SIZE", clickhouse.DefaultWriteQueueSize)
+		workersDef        = getEnvIntOrDefault("WRITER_WORKERS", clickhouse.DefaultWriteWorkers)
+		batchMaxRowsDef   = getEnvIntOrDefault("WRITER_BATCH_MAX_ROWS", clickhouse.DefaultBatchMaxRows)
+		batchMaxWaitDef   = getEnvDurationOrDefault("WRITER_BATCH_MAX_WAIT", clickhouse.DefaultBatchMaxWait)
+		enqueueTimeoutDef = getEnvDurationOrDefault("WRITER_ENQUEUE_TIMEOUT", clickhouse.DefaultEnqueueTimeout)
+		drainTimeoutDef   = getEnvDurationOrDefault("WRITER_DRAIN_TIMEOUT", clickhouse.DefaultShutdownDrainTimeout)
+	)
+	t := &writerTuning{}
+	fs.IntVar(&t.queueSize, "writer-queue-size", queueSizeDef,
+		"Capacity of the async write hand-off queue (jobs). Can also be set via the WRITER_QUEUE_SIZE env var.")
+	fs.IntVar(&t.workers, "writer-workers", workersDef,
+		"Number of workers draining the write queue into ClickHouse. Can also be set via the WRITER_WORKERS env var.")
+	fs.IntVar(&t.batchMaxRows, "writer-batch-max-rows", batchMaxRowsDef,
+		"Row count at which a worker flushes its accumulated insert batch. "+
+			"Can also be set via the WRITER_BATCH_MAX_ROWS env var.")
+	fs.DurationVar(&t.batchMaxWait, "writer-batch-max-wait", batchMaxWaitDef,
+		"Maximum time a batch's first job waits for the batch to fill before flushing regardless. "+
+			"Can also be set via the WRITER_BATCH_MAX_WAIT env var.")
+	fs.DurationVar(&t.enqueueTimeout, "writer-enqueue-timeout", enqueueTimeoutDef,
+		"How long Enqueue waits for queue room before returning an error (the job is never dropped silently). "+
+			"Can also be set via the WRITER_ENQUEUE_TIMEOUT env var.")
+	fs.DurationVar(&t.drainTimeout, "writer-drain-timeout", drainTimeoutDef,
+		"Time budget for draining queued writes to ClickHouse during graceful shutdown. "+
+			"Can also be set via the WRITER_DRAIN_TIMEOUT env var.")
+	return t
+}
+
 // parseGVKList parses a comma-separated list of GroupVersionKinds, each
 // given as "version/kind" (core group, e.g. "v1/Pod") or
 // "group/version/kind" (e.g. "apps/v1/Deployment",
@@ -238,6 +295,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	// The six async-write-path knobs (D2): registered on the shared
+	// flag.CommandLine so they are parsed by the flag.Parse() below.
+	writer := registerWriterFlags(flag.CommandLine)
 	opts := zap.Options{
 		Development: true,
 	}
@@ -338,13 +398,19 @@ func main() {
 	}
 
 	chConfig := clickhouse.Config{
-		Addr:             chAddr,
-		Database:         chDatabase,
-		Username:         chUsername,
-		Password:         os.Getenv("CH_PASSWORD"),
-		DialTimeout:      chDialTimeout,
-		ReadTimeout:      chReadTimeout,
-		AutoCreateSchema: chAutoCreateSchema,
+		Addr:                 chAddr,
+		Database:             chDatabase,
+		Username:             chUsername,
+		Password:             os.Getenv("CH_PASSWORD"),
+		DialTimeout:          chDialTimeout,
+		ReadTimeout:          chReadTimeout,
+		AutoCreateSchema:     chAutoCreateSchema,
+		WriteQueueSize:       writer.queueSize,
+		WriteWorkers:         writer.workers,
+		BatchMaxRows:         writer.batchMaxRows,
+		BatchMaxWait:         writer.batchMaxWait,
+		EnqueueTimeout:       writer.enqueueTimeout,
+		ShutdownDrainTimeout: writer.drainTimeout,
 	}
 	if chConfig.Password == "" {
 		setupLog.Info("CH_PASSWORD is not set; connecting to ClickHouse without a password")

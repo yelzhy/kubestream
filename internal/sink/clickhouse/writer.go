@@ -38,15 +38,33 @@ import (
 	"github.com/yelzhy/kubestream/internal/sink"
 )
 
+// These are the tunable-knob defaults for the async write path. They are
+// exported so cmd/main.go can advertise the exact same values as its
+// flag/env defaults (--writer-* and their WRITER_* twins, Task 0.8) — a single
+// source of truth, so the documented default, the --help text, and the
+// behavior when a knob is left at zero can never drift apart. NewCHWriter still
+// clamps any non-positive value back to these, so passing 0 anywhere is
+// equivalent to passing the default.
 const (
-	defaultWriteQueueSize       = 5000
-	defaultWriteWorkers         = 4
-	defaultBatchMaxRows         = 1000
-	defaultBatchMaxWait         = 1 * time.Second
-	defaultInsertTimeout        = 5 * time.Second
-	defaultEnqueueTimeout       = 2 * time.Second
-	defaultMaxRetryBackoff      = 60 * time.Second
-	defaultShutdownDrainTimeout = 15 * time.Second
+	// DefaultWriteQueueSize is the hand-off queue capacity (jobs).
+	DefaultWriteQueueSize = 5000
+	// DefaultWriteWorkers is the number of queue-draining workers.
+	DefaultWriteWorkers = 4
+	// DefaultBatchMaxRows is the row count that flushes an accumulating batch.
+	DefaultBatchMaxRows = 1000
+	// DefaultBatchMaxWait is the maximum time a batch's first job waits for the
+	// batch to fill before it is flushed regardless.
+	DefaultBatchMaxWait = 1 * time.Second
+	// DefaultEnqueueTimeout is how long Enqueue waits for queue room before
+	// giving up (never dropping the job silently).
+	DefaultEnqueueTimeout = 2 * time.Second
+	// DefaultShutdownDrainTimeout bounds the post-shutdown drain phase.
+	DefaultShutdownDrainTimeout = 15 * time.Second
+)
+
+const (
+	defaultInsertTimeout   = 5 * time.Second
+	defaultMaxRetryBackoff = 60 * time.Second
 
 	chTimeFormat = "2006-01-02 15:04:05.999999999"
 
@@ -76,10 +94,19 @@ type Config struct {
 	// batch to ClickHouse; BatchMaxWait is the maximum time a batch's first job
 	// waits for the batch to fill before it is flushed regardless. These are the
 	// client-side batching knobs (row-per-INSERT is ClickHouse's pathological
-	// write pattern); flags plumb into them in Task 0.8. Zero values fall back
-	// to the package defaults in NewCHWriter.
+	// write pattern). Zero values fall back to the package defaults in
+	// NewCHWriter.
 	BatchMaxRows int
 	BatchMaxWait time.Duration
+	// WriteQueueSize, WriteWorkers, EnqueueTimeout, and ShutdownDrainTimeout are
+	// the remaining async-write-path knobs D2 requires operators to size per
+	// environment. Sourced from the --writer-* flags / WRITER_* env twins in
+	// cmd/main.go (Task 0.8); each zero value falls back to its Default* above
+	// via NewCHWriter, so an unset knob keeps the shipped behavior.
+	WriteQueueSize       int
+	WriteWorkers         int
+	EnqueueTimeout       time.Duration
+	ShutdownDrainTimeout time.Duration
 }
 
 // Metrics is the narrow slice of pipeline metrics CHWriter records. It is an
@@ -137,6 +164,11 @@ type CHWriter struct {
 	batchMaxRows int
 	batchMaxWait time.Duration
 
+	// enqueueTimeout bounds how long Enqueue blocks waiting for queue room
+	// before returning an error (the job is never dropped silently). Sourced
+	// from --writer-enqueue-timeout / WRITER_ENQUEUE_TIMEOUT via Config; falls
+	// back to DefaultEnqueueTimeout when non-positive.
+	enqueueTimeout       time.Duration
 	insertTimeout        time.Duration
 	maxRetryBackoff      time.Duration
 	shutdownDrainTimeout time.Duration
@@ -174,18 +206,21 @@ type CHWriter struct {
 // the metrics sink it reports to. Zero-valued queueSize/workers/timeouts fall
 // back to sane defaults. Exposed (rather than only Open) so tests can drive the
 // writer with a fake driver.Conn and an isolated metrics instance.
-func NewCHWriter(conn driver.Conn, queueSize, workers, batchMaxRows int, insertTimeout, maxRetryBackoff, shutdownDrainTimeout, batchMaxWait time.Duration, metrics Metrics) *CHWriter {
+func NewCHWriter(conn driver.Conn, queueSize, workers, batchMaxRows int, insertTimeout, maxRetryBackoff, shutdownDrainTimeout, batchMaxWait, enqueueTimeout time.Duration, metrics Metrics) *CHWriter {
 	if queueSize <= 0 {
-		queueSize = defaultWriteQueueSize
+		queueSize = DefaultWriteQueueSize
 	}
 	if workers <= 0 {
-		workers = defaultWriteWorkers
+		workers = DefaultWriteWorkers
 	}
 	if batchMaxRows <= 0 {
-		batchMaxRows = defaultBatchMaxRows
+		batchMaxRows = DefaultBatchMaxRows
 	}
 	if batchMaxWait <= 0 {
-		batchMaxWait = defaultBatchMaxWait
+		batchMaxWait = DefaultBatchMaxWait
+	}
+	if enqueueTimeout <= 0 {
+		enqueueTimeout = DefaultEnqueueTimeout
 	}
 	if insertTimeout <= 0 {
 		insertTimeout = defaultInsertTimeout
@@ -194,7 +229,7 @@ func NewCHWriter(conn driver.Conn, queueSize, workers, batchMaxRows int, insertT
 		maxRetryBackoff = defaultMaxRetryBackoff
 	}
 	if shutdownDrainTimeout <= 0 {
-		shutdownDrainTimeout = defaultShutdownDrainTimeout
+		shutdownDrainTimeout = DefaultShutdownDrainTimeout
 	}
 	return &CHWriter{
 		conn:                 conn,
@@ -202,6 +237,7 @@ func NewCHWriter(conn driver.Conn, queueSize, workers, batchMaxRows int, insertT
 		workers:              workers,
 		batchMaxRows:         batchMaxRows,
 		batchMaxWait:         batchMaxWait,
+		enqueueTimeout:       enqueueTimeout,
 		insertTimeout:        insertTimeout,
 		maxRetryBackoff:      maxRetryBackoff,
 		shutdownDrainTimeout: shutdownDrainTimeout,
@@ -230,7 +266,8 @@ func Open(cfg Config, metrics Metrics) (*CHWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := NewCHWriter(conn, 0, 0, cfg.BatchMaxRows, cfg.ReadTimeout, 0, 0, cfg.BatchMaxWait, metrics)
+	w := NewCHWriter(conn, cfg.WriteQueueSize, cfg.WriteWorkers, cfg.BatchMaxRows, cfg.ReadTimeout, 0,
+		cfg.ShutdownDrainTimeout, cfg.BatchMaxWait, cfg.EnqueueTimeout, metrics)
 	w.database = cfg.Database
 	w.autoCreate = cfg.AutoCreateSchema
 	return w, nil
@@ -274,8 +311,8 @@ func (w *CHWriter) RegisterWithManager(mgr manager.Manager) error {
 // Enqueue submits a write job without blocking the caller on the actual
 // ClickHouse round-trip. The job's Record is rendered to the insert query and
 // positional args here, once, so workers never touch sink types. If the queue
-// is full, it waits up to the default enqueue timeout for room before giving up
-// — a job is never dropped silently. A returned error should be propagated by
+// is full, it waits up to the configured enqueue timeout for room before giving
+// up — a job is never dropped silently. A returned error should be propagated by
 // the caller (e.g. as Reconcile's own error) so controller-runtime's requeue
 // and backoff take over as backpressure; nothing is lost in the meantime
 // because the informer cache still holds the object's latest state for the
@@ -296,7 +333,7 @@ func (w *CHWriter) Enqueue(ctx context.Context, job sink.Job) error {
 	w.mu.Unlock()
 	defer w.inflight.Done()
 
-	timer := time.NewTimer(defaultEnqueueTimeout)
+	timer := time.NewTimer(w.enqueueTimeout)
 	defer timer.Stop()
 
 	// enqueue_block_seconds measures how long the hot path actually waited for
@@ -314,7 +351,7 @@ func (w *CHWriter) Enqueue(ctx context.Context, job sink.Job) error {
 	case <-timer.C:
 		w.metrics.ObserveEnqueueBlock(time.Since(start).Seconds())
 		w.metrics.IncEnqueueTimeout()
-		return fmt.Errorf("chwriter: write queue still full after waiting %s", defaultEnqueueTimeout)
+		return fmt.Errorf("chwriter: write queue still full after waiting %s", w.enqueueTimeout)
 	}
 }
 

@@ -98,6 +98,43 @@ test-integration: ## Run integration tests against a dockerized ClickHouse.
 	CH_TEST_ADDR=$(CH_IT_ADDR) CH_TEST_USER=$(CH_IT_USER) CH_TEST_PASSWORD=$(CH_IT_PASSWORD) \
 		go test -tags=integration ./internal/controller/... -run Integration -v
 
+# bench-load runs the synthetic-churn load harness (test/loadgen, Task 0.8)
+# against a throwaway dockerized ClickHouse plus an in-process envtest apiserver.
+# It reuses the same container bring-up as test-integration and additionally
+# provides KUBEBUILDER_ASSETS (as the `test` target does) so envtest can start.
+# LOADGEN_* override the small default profile, e.g.:
+#   make bench-load LOADGEN_OBJECTS=200 LOADGEN_RATE=2000 LOADGEN_DURATION=30s
+LOADGEN_OBJECTS ?= 50
+LOADGEN_RATE ?= 200
+LOADGEN_PAYLOAD_BYTES ?= 2048
+LOADGEN_DURATION ?= 10s
+LOADGEN_DELETE_RATIO ?= 0
+
+.PHONY: bench-load
+bench-load: setup-envtest ## Run the load benchmark harness (small default profile) against a dockerized ClickHouse.
+	@echo "Starting ClickHouse container '$(CH_IT_CONTAINER)'..."
+	@$(CONTAINER_TOOL) rm -f $(CH_IT_CONTAINER) >/dev/null 2>&1 || true
+	@$(CONTAINER_TOOL) run -d --name $(CH_IT_CONTAINER) \
+		--ulimit nofile=262144:262144 \
+		-e CLICKHOUSE_USER=$(CH_IT_USER) -e CLICKHOUSE_PASSWORD=$(CH_IT_PASSWORD) \
+		-p 19000:9000 -p 18123:8123 \
+		$(CH_IT_IMAGE) >/dev/null
+	@trap '$(CONTAINER_TOOL) rm -f $(CH_IT_CONTAINER) >/dev/null 2>&1 || true' EXIT; \
+	echo "Waiting for ClickHouse to accept connections..."; \
+	for i in $$(seq 1 30); do \
+		if $(CONTAINER_TOOL) exec $(CH_IT_CONTAINER) clickhouse-client --user $(CH_IT_USER) --password $(CH_IT_PASSWORD) --query "SELECT 1" >/dev/null 2>&1; then \
+			echo "ClickHouse is ready."; \
+			break; \
+		fi; \
+		if [ $$i -eq 30 ]; then echo "ClickHouse did not become ready in time"; exit 1; fi; \
+		sleep 1; \
+	done; \
+	KUBEBUILDER_ASSETS="$$("$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" \
+	CH_TEST_ADDR=$(CH_IT_ADDR) CH_TEST_USER=$(CH_IT_USER) CH_TEST_PASSWORD=$(CH_IT_PASSWORD) \
+		go test -tags=integration ./test/loadgen/ -run TestLoadGenChurn -v -timeout 10m \
+			-objects=$(LOADGEN_OBJECTS) -rate=$(LOADGEN_RATE) -payload-bytes=$(LOADGEN_PAYLOAD_BYTES) \
+			-duration=$(LOADGEN_DURATION) -delete-ratio=$(LOADGEN_DELETE_RATIO)
+
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # kubectl kuberc is disabled by default for test isolation; enable with:
