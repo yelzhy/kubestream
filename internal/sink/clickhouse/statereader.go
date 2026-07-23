@@ -35,6 +35,16 @@ import (
 // A non-empty filter.Namespace narrows to that namespace; an empty one matches
 // every namespace (the GVK-wide scope today's warm-up uses), so the emitted SQL
 // is identical to the original inline query when Namespace is unset.
+//
+// This read is dedup-safe under resource_states' ReplacingMergeTree engine
+// without FINAL: it GROUPs BY (namespace, name), so it emits exactly one row per
+// identity by construction regardless of how many unmerged duplicate rows the
+// table still holds. A ReplacingMergeTree duplicate is byte-identical to its
+// original (the at-least-once write path re-inserts the same frozen ts and
+// values — see 001_resource_states.sql), so argMax(uid, ts) / argMax(sha256, ts)
+// / argMax(event_type, ts) return the same value whether the table has collapsed
+// the duplicates yet or not. The warm-up therefore never double-counts or
+// mis-reads an identity from a pre-merge duplicate.
 func lastKnownStatesQuery(filter sink.ScopeFilter) (string, []any) {
 	query := `
         SELECT namespace, name, argMax(uid, ts), argMax(sha256, ts)

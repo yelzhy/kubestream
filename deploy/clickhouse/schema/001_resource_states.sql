@@ -16,6 +16,16 @@ CREATE TABLE IF NOT EXISTS resource_states
     diff             String CODEC(ZSTD(3)),           -- RFC 6902 JSON Patch (Modified/Checkpoint), empty otherwise
     sha256           String                           -- hex of normalized JSON; empty on Deleted
 )
-ENGINE = MergeTree
+-- ReplacingMergeTree (not plain MergeTree): the operator's write path is
+-- at-least-once. A lost acknowledgement after a successful server-side insert
+-- makes the poison-isolation path re-insert a byte-identical row (same ts —
+-- frozen once at reconcile time — plus identical sha256, uid, event_type, data,
+-- and diff). Such a re-insert collides on the full ORDER BY key, so
+-- ReplacingMergeTree collapses it to a single row on merge. A genuinely-distinct
+-- event never collides: ts is DateTime64(9) (nanosecond) and frozen per event,
+-- so the ORDER BY tuple alone distinguishes real re-inserts from real events.
+-- Readers needing exact counts before a merge must use FINAL (or an equivalent
+-- argMax / LIMIT 1 BY dedup) — see docs/SCHEMA.md "Delivery semantics".
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (cluster_id, api_group, kind, namespace, name, ts);

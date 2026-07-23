@@ -180,6 +180,35 @@ func registerWriterFlags(fs *flag.FlagSet) *writerTuning {
 	return t
 }
 
+// defaultMaxConcurrentReconciles is the shipped RECONCILER_MAX_CONCURRENT
+// default. It is 1 because the current controller-runtime-driven Reconcile
+// performs a read-decide-write (Load the diff baseline → compute diff → Reserve
+// → enqueue) that is not atomic with its asynchronous write commit. Any value
+// above 1 breaks Invariant 2 (per-key serialization): two concurrent same-key
+// Reconciles can both Load the same committed baseline and each emit a diff
+// against it, corrupting the recorded ClickHouse history. The version gate keeps
+// the in-memory cache correct but cannot un-emit those rows. Real per-key
+// concurrency arrives with the Phase 1 workqueue pipeline, which owns that
+// guarantee — see controller.ReconcilerConfig.MaxConcurrentReconciles.
+const defaultMaxConcurrentReconciles = 1
+
+// registerReconcilerConcurrencyFlag registers --reconciler-max-concurrent (env
+// twin RECONCILER_MAX_CONCURRENT) on fs and returns the bound value. Split out
+// of main() so cmd/main_test.go can assert the shipped default and the env/flag
+// override in isolation, mirroring registerWriterFlags. The flag/env plumbing is
+// unchanged — the value stays operator-configurable; only its default is 1.
+func registerReconcilerConcurrencyFlag(fs *flag.FlagSet) *int {
+	v := new(int)
+	fs.IntVar(v, "reconciler-max-concurrent",
+		getEnvIntOrDefault("RECONCILER_MAX_CONCURRENT", defaultMaxConcurrentReconciles),
+		"Maximum concurrent Reconciles per watched resource type. Values above 1 are UNSAFE under the current "+
+			"controller-runtime-driven architecture: a Reconcile's diff-baseline read is not atomic with its "+
+			"asynchronous write commit, so two concurrent same-key Reconciles can emit diff rows computed against "+
+			"the same baseline and corrupt the recorded history (Invariant 2). Safe per-key concurrency arrives "+
+			"with the Phase 1 workqueue pipeline. Can also be set via the RECONCILER_MAX_CONCURRENT env var.")
+	return v
+}
+
 // parseGVKList parses a comma-separated list of GroupVersionKinds, each
 // given as "version/kind" (core group, e.g. "v1/Pod") or
 // "group/version/kind" (e.g. "apps/v1/Deployment",
@@ -266,13 +295,11 @@ func main() {
 	// visible in `ps`/process listings, which a Secret-projected env var
 	// avoids.
 	var clusterID string
-	var maxConcurrentReconciles int
 	var watchedGVKsRaw string
 	flag.StringVar(&clusterID, "cluster-id", getEnvOrDefault("CLUSTER_ID", "local-kind-cluster"),
 		"Identifier for this cluster, recorded on every row written to ClickHouse. "+
 			"Can also be set via the CLUSTER_ID env var.")
-	flag.IntVar(&maxConcurrentReconciles, "reconciler-max-concurrent", getEnvIntOrDefault("RECONCILER_MAX_CONCURRENT", 5),
-		"Maximum concurrent Reconciles per watched resource type. Can also be set via the RECONCILER_MAX_CONCURRENT env var.")
+	maxConcurrentReconciles := registerReconcilerConcurrencyFlag(flag.CommandLine)
 	flag.StringVar(&watchedGVKsRaw, "watched-gvks", getEnvOrDefault("WATCHED_GVKS", defaultWatchedGVKs),
 		"Comma-separated list of resource types to watch, each as \"version/kind\" or \"group/version/kind\" "+
 			"(e.g. \"v1/Pod,apps/v1/Deployment,networking.k8s.io/v1/Ingress\"). Adding a type outside the "+
@@ -359,11 +386,6 @@ func main() {
 	// If the certificate is not specified, controller-runtime will automatically
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
-	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -429,7 +451,7 @@ func main() {
 
 	reconcilerConfig := controller.ReconcilerConfig{
 		ClusterID:               clusterID,
-		MaxConcurrentReconciles: maxConcurrentReconciles,
+		MaxConcurrentReconciles: *maxConcurrentReconciles,
 		WatchedGVKs:             watchedGVKs,
 	}
 

@@ -19,6 +19,7 @@ package clickhouse
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -510,6 +511,172 @@ func TestWritesTotalFailedIncrements(t *testing.T) {
 	}
 	if v := writesTotalValue(t, reg, "success"); v != 0 {
 		t.Fatalf("writes_total{outcome=\"success\"} = %v, want 0", v)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+// TestInsertArgsTimestampFrozen supports Fix 2 (Task 0.9): it proves that
+// rendering the same sink.Record to insert args twice produces byte-identical
+// positional args, including the timestamp. Record.Timestamp is stamped once at
+// reconcile time and never re-stamped on a retry / re-Exec, which is exactly the
+// property ReplacingMergeTree relies on — a re-inserted row is byte-identical
+// and therefore collapses on merge.
+func TestInsertArgsTimestampFrozen(t *testing.T) {
+	rec := sink.Record{
+		Timestamp:       time.Date(2026, 7, 23, 10, 30, 45, 123456789, time.UTC),
+		ClusterID:       "c1",
+		EventType:       "Modified",
+		APIGroup:        "apps",
+		APIVersion:      "v1",
+		Kind:            "Deployment",
+		Namespace:       "default",
+		Name:            "frozen",
+		UID:             "uid-frozen",
+		ResourceVersion: "42",
+		Labels:          map[string]string{"app": "demo"},
+		Actors:          []string{"kubectl"},
+		Data:            "",
+		Diff:            `[{"op":"replace","path":"/x","value":1}]`,
+		SHA256:          "deadbeef",
+	}
+
+	first := insertArgs(rec)
+	second := insertArgs(rec)
+
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("insertArgs is not deterministic:\n first  = %v\n second = %v", first, second)
+	}
+
+	// The timestamp is positional arg 0; assert it round-trips to the exact
+	// frozen value both times (a re-stamp would change it between calls).
+	wantTS := rec.Timestamp.UTC().Format(chTimeFormat)
+	if first[0] != wantTS || second[0] != wantTS {
+		t.Fatalf("timestamp arg = (%v, %v), want %q both times", first[0], second[0], wantTS)
+	}
+}
+
+// TestIsolationPhaseBoundedOnHungBackend is the Fix 3 (M3) guard against a
+// wedged worker (Task 0.9). The backend is "hung": each row's Exec blocks until
+// its own context is cancelled (it never succeeds or errors on its own), and the
+// batch Send always fails so the whole batch falls through to per-row isolation.
+// With maxIsolationPhase set well below len(batch)×insertTimeout, the isolation
+// phase must return at roughly the phase budget — NOT insertTimeout×batchMaxRows,
+// which is the unbounded behavior this fix removes. Every job must still commit
+// exactly once, with outcome false. Run under -race.
+func TestIsolationPhaseBoundedOnHungBackend(t *testing.T) {
+	const batchMaxRows = 10
+	const insertTimeout = 2 * time.Second
+	const maxIsolationPhase = 500 * time.Millisecond
+
+	conn := &fakeConn{
+		// Batch always fails → forces the isolation path.
+		sendErr: func(context.Context, [][]any) error { return errors.New("batch rejected") },
+		// Hung backend: block until the row context is cancelled, then surface it.
+		execErr: func(ctx context.Context, _ []any) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	reg := prometheus.NewRegistry()
+	m := controller.NewPipelineMetrics(reg)
+	// One worker so all rows land in one batch; tiny retry cap so the batch phase
+	// exhausts fast and the isolation phase dominates; large batchMaxWait so only
+	// the row-count flush fires.
+	w := NewCHWriter(conn, 100, 1, batchMaxRows, insertTimeout, 20*time.Millisecond, time.Second, 30*time.Second, time.Second, m)
+	w.maxIsolationPhase = maxIsolationPhase // same-package override; not a NewCHWriter param.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+
+	log := newCommitLog()
+	start := time.Now()
+	for i := range batchMaxRows {
+		enqueueNamed(t, w, ctx, log, "h"+strconv.Itoa(i))
+	}
+
+	waitForCommits(t, log, batchMaxRows, 10*time.Second)
+	elapsed := time.Since(start)
+
+	// The unbounded behavior would be insertTimeout×batchMaxRows = 20s. A bound
+	// far below that (and far above the phase budget to tolerate CI jitter)
+	// proves the phase cap fired rather than every hung row burning insertTimeout.
+	const unbounded = insertTimeout * batchMaxRows
+	if elapsed >= unbounded/4 {
+		t.Fatalf("isolation phase took %s; expected roughly the phase budget (%s), not near %s",
+			elapsed, maxIsolationPhase, unbounded)
+	}
+
+	total, trues, falses := log.counts()
+	if total != batchMaxRows || trues != 0 || falses != batchMaxRows {
+		t.Fatalf("commits: total=%d trues=%d falses=%d, want %d/0/%d", total, trues, falses, batchMaxRows, batchMaxRows)
+	}
+	if n := log.maxPerName(); n != 1 {
+		t.Fatalf("a job committed %d times, want exactly 1", n)
+	}
+	if v := writesTotalValue(t, reg, "failed"); v != batchMaxRows {
+		t.Fatalf("writes_total{failed} = %v, want %d", v, batchMaxRows)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+// TestIsolationPhaseDoesNotTruncateSlowBackend is the Fix 3 non-starvation guard
+// (Task 0.9). Each isolation Exec succeeds after a delay comfortably under
+// insertTimeout but non-trivial, so the cumulative loop time is a meaningful
+// fraction of the phase budget; the batch Send always fails to force isolation.
+// Every row must settle commit(true) — none cancelled by the phase bound — which
+// proves the bound is sized never to convert mere slowness into a manufactured
+// failure. That non-truncation property is what distinguishes a correct Fix 3
+// from a naive whole-loop timeout. Run under -race.
+func TestIsolationPhaseDoesNotTruncateSlowBackend(t *testing.T) {
+	const batchMaxRows = 20
+	const insertTimeout = 1 * time.Second
+	const rowDelay = 50 * time.Millisecond // comfortably under insertTimeout
+	const maxIsolationPhase = 4 * time.Second
+
+	conn := &fakeConn{
+		sendErr: func(context.Context, [][]any) error { return errors.New("batch rejected") },
+		// Slow but alive: each row returns success after rowDelay.
+		execErr: func(context.Context, []any) error {
+			time.Sleep(rowDelay)
+			return nil
+		},
+	}
+
+	reg := prometheus.NewRegistry()
+	m := controller.NewPipelineMetrics(reg)
+	w := NewCHWriter(conn, 100, 1, batchMaxRows, insertTimeout, 20*time.Millisecond, time.Second, 30*time.Second, time.Second, m)
+	w.maxIsolationPhase = maxIsolationPhase
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+
+	log := newCommitLog()
+	for i := range batchMaxRows {
+		enqueueNamed(t, w, ctx, log, "s"+strconv.Itoa(i))
+	}
+
+	waitForCommits(t, log, batchMaxRows, 30*time.Second)
+
+	total, trues, falses := log.counts()
+	if total != batchMaxRows || trues != batchMaxRows || falses != 0 {
+		t.Fatalf("commits: total=%d trues=%d falses=%d, want %d/%d/0", total, trues, falses, batchMaxRows, batchMaxRows)
+	}
+	if n := log.maxPerName(); n != 1 {
+		t.Fatalf("a job committed %d times, want exactly 1", n)
+	}
+	if v := writesTotalValue(t, reg, "success"); v != batchMaxRows {
+		t.Fatalf("writes_total{success} = %v, want %d", v, batchMaxRows)
 	}
 
 	cancel()

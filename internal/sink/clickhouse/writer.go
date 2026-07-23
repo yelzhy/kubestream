@@ -65,6 +65,20 @@ const (
 const (
 	defaultInsertTimeout   = 5 * time.Second
 	defaultMaxRetryBackoff = 60 * time.Second
+	// defaultMaxIsolationPhase is the ceiling on how long the per-row poison-
+	// isolation phase of a single flushBatch may run before a hung backend is
+	// declared and the remaining rows are failed (and requeued by the caller).
+	// It bounds the worst case that Fix 3 (Task 0.9) closes: with the shipped
+	// defaults the isolation loop could otherwise spend insertTimeout on each of
+	// up to batchMaxRows rows (5s × 1000 ≈ 83 minutes) with one worker pinned on
+	// a single doomed batch during a sustained outage. The effective per-batch
+	// budget is min(len(batch)×insertTimeout, this) — small and typical batches
+	// get the full sum-of-per-row-timeouts (so a slow-but-responsive backend is
+	// never truncated), while only an oversized batch against an unresponsive
+	// backend hits this ceiling. Two minutes leaves generous headroom for any
+	// healthy backend (a single-row insert settles in milliseconds) while
+	// converting an indefinite hang into a bounded, retried failure.
+	defaultMaxIsolationPhase = 2 * time.Minute
 
 	chTimeFormat = "2006-01-02 15:04:05.999999999"
 
@@ -172,6 +186,13 @@ type CHWriter struct {
 	insertTimeout        time.Duration
 	maxRetryBackoff      time.Duration
 	shutdownDrainTimeout time.Duration
+	// maxIsolationPhase caps the whole per-row poison-isolation phase of one
+	// flushBatch (all rows, not each row), so a hung backend cannot pin a worker
+	// for insertTimeout × batchMaxRows. It is not a NewCHWriter parameter (the
+	// constructor signature is a stable contract the existing tests depend on);
+	// NewCHWriter always sets it to defaultMaxIsolationPhase, and same-package
+	// tests set it directly to exercise the bound. See flushBatch.
+	maxIsolationPhase time.Duration
 
 	// mu guards closing and drainCtx; see Enqueue/attemptContext.
 	mu      sync.Mutex
@@ -241,6 +262,7 @@ func NewCHWriter(conn driver.Conn, queueSize, workers, batchMaxRows int, insertT
 		insertTimeout:        insertTimeout,
 		maxRetryBackoff:      maxRetryBackoff,
 		shutdownDrainTimeout: shutdownDrainTimeout,
+		maxIsolationPhase:    defaultMaxIsolationPhase,
 		drainCtx:             context.Background(),
 		metrics:              metrics,
 	}
@@ -496,10 +518,22 @@ func (w *CHWriter) worker(ctx context.Context, log logr.Logger) {
 }
 
 // flushBatch persists a full batch of jobs to ClickHouse and settles each job's
-// commit callback. It is the sole place a batch's outcomes are settled, and it
-// guarantees the exactly-once contract sink.Job documents:
+// commit callback. It is the sole place a batch's outcomes are settled.
+//
+// Exactly-once is a property of the commit callback, not of row insertion:
 //
 //	Every commit callback fires exactly once per job across all paths.
+//
+// Row insertion itself is at-least-once. driver.Batch.Send() (and a single-row
+// Exec) is a network operation with three outcomes: nothing inserted;
+// everything inserted but the acknowledgement lost (timeout / connection reset
+// mid-response); or a partial insert. In the lost-ack and partial cases the call
+// returns an error while the rows are already durable in ClickHouse, so the
+// isolation path below re-inserts them. Each re-insert is byte-identical to the
+// original — Record.Timestamp is frozen once at reconcile time and rendered into
+// the positional args by insertArgs — so resource_states (ReplacingMergeTree)
+// collapses it to a single row on merge (see docs/SCHEMA.md, "Delivery
+// semantics"). The commit callback still fires exactly once regardless.
 //
 // The happy path prepares one client-side batch and Sends it (row-per-INSERT is
 // ClickHouse's pathological write pattern), retrying the whole batch with the
@@ -508,6 +542,21 @@ func (w *CHWriter) worker(ctx context.Context, log logr.Logger) {
 // row cannot doom its blameless batch-mates — only the individually-failing
 // rows get commit(false) (and the caller's revert/requeue path), the rest get
 // commit(true).
+//
+// The isolation phase runs under its own bounded sub-context (isolationCtx),
+// derived from the attemptContext-selected ctx so a shutdown drain stays capped
+// by shutdownDrainTimeout as before. The phase budget is
+// min(len(batch)×insertTimeout, maxIsolationPhase): a hung backend (rows neither
+// succeeding nor erroring) can no longer pin a worker for insertTimeout ×
+// batchMaxRows. The budget is sized never to truncate a responsive backend — it
+// is ≥ the sum of the per-row insertTimeouts for any batch up to the ceiling, so
+// a merely slow-but-alive backend always finishes and no row that would have
+// succeeded is cancelled into a manufactured failure. When the sub-context does
+// expire (only a genuinely unresponsive backend reaches it), the in-flight and
+// all remaining rows settle via the normal path — their Exec returns a context
+// error, they are counted writes_total{outcome="failed"} and committed false
+// exactly once, and the caller's revert/requeue re-drives them. It converts an
+// unbounded hang into a bounded, retried failure.
 //
 //nolint:logcheck
 func (w *CHWriter) flushBatch(ctx context.Context, log logr.Logger, batch []writeJob) {
@@ -533,10 +582,14 @@ func (w *CHWriter) flushBatch(ctx context.Context, log logr.Logger, batch []writ
 
 	// Batch exhausted retries. Re-attempt each row individually, exactly once,
 	// so one poison row is blamed in isolation rather than failing the batch.
+	// The whole phase is bounded by isolationCtx so a hung backend can't pin the
+	// worker; each row still gets its own insertTimeout inside that cap.
 	log.Error(err, "chwriter: batch write failed after retries; isolating rows individually", "rows", len(batch))
+	isolationCtx, cancelPhase := context.WithTimeout(ctx, min(time.Duration(len(batch))*w.insertTimeout, w.maxIsolationPhase))
+	defer cancelPhase()
 	for _, job := range batch {
 		rowStart := time.Now()
-		rowCtx, cancel := context.WithTimeout(ctx, w.insertTimeout)
+		rowCtx, cancel := context.WithTimeout(isolationCtx, w.insertTimeout)
 		rowErr := w.conn.Exec(rowCtx, job.query, job.args...)
 		cancel()
 

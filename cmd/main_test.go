@@ -152,6 +152,56 @@ func TestParseGVKListAllowsSameGroupDifferentKinds(t *testing.T) {
 	}
 }
 
+// parseReconcilerConcurrency registers --reconciler-max-concurrent on a
+// throwaway FlagSet and parses args against it, so a test drives the exact
+// registration path main() uses without touching the global flag.CommandLine.
+func parseReconcilerConcurrency(t *testing.T, args []string) (int, error) {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	v := registerReconcilerConcurrencyFlag(fs)
+	err := fs.Parse(args)
+	return *v, err
+}
+
+// TestReconcilerMaxConcurrentDefault is the Fix 1 (Task 0.9) guard: with
+// RECONCILER_MAX_CONCURRENT unset the resolved value must be 1 — the only value
+// safe under the current controller-runtime-driven Reconcile (Invariant 2). It
+// also proves the knob stays operator-configurable: an explicit override, via
+// either the env twin or the flag, is still honored.
+func TestReconcilerMaxConcurrentDefault(t *testing.T) {
+	t.Run("unset resolves to 1", func(t *testing.T) {
+		got, err := parseReconcilerConcurrency(t, nil)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got != 1 {
+			t.Fatalf("MaxConcurrentReconciles default = %d, want 1", got)
+		}
+	})
+
+	t.Run("env override is honored", func(t *testing.T) {
+		t.Setenv("RECONCILER_MAX_CONCURRENT", "3")
+		got, err := parseReconcilerConcurrency(t, nil)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got != 3 {
+			t.Fatalf("MaxConcurrentReconciles with env=3 = %d, want 3", got)
+		}
+	})
+
+	t.Run("flag override is honored", func(t *testing.T) {
+		got, err := parseReconcilerConcurrency(t, []string{"--reconciler-max-concurrent=3"})
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got != 3 {
+			t.Fatalf("MaxConcurrentReconciles with flag=3 = %d, want 3", got)
+		}
+	})
+}
+
 // parseWriterFlags registers the --writer-* flags on a throwaway FlagSet and
 // parses args against them, so a test drives the exact same registration path
 // main() uses without touching the global flag.CommandLine. Parse output is

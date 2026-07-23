@@ -536,6 +536,12 @@ func (r *ResourceStreamReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	record := sink.Record{
+		// Timestamp is stamped exactly once here, at reconcile time, and is never
+		// re-stamped on retry: insertArgs renders it into the positional args
+		// once, so a re-Exec by the sink's at-least-once isolation path re-sends
+		// the identical ts. That immutability is precisely what makes a
+		// re-inserted row byte-identical and lets resource_states
+		// (ReplacingMergeTree) collapse it on merge — see docs/SCHEMA.md.
 		Timestamp:       time.Now().UTC(),
 		ClusterID:       r.ClusterID,
 		EventType:       eventType,

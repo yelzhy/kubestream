@@ -53,7 +53,17 @@ One row per observed state transition of a watched object.
 **Engine & layout:**
 
 ```sql
-ENGINE = MergeTree
+-- ReplacingMergeTree (not plain MergeTree): the operator's write path is
+-- at-least-once. A lost acknowledgement after a successful server-side insert
+-- makes the poison-isolation path re-insert a byte-identical row (same ts —
+-- frozen once at reconcile time — plus identical sha256, uid, event_type, data,
+-- and diff). Such a re-insert collides on the full ORDER BY key, so
+-- ReplacingMergeTree collapses it to a single row on merge. A genuinely-distinct
+-- event never collides: ts is DateTime64(9) (nanosecond) and frozen per event,
+-- so the ORDER BY tuple alone distinguishes real re-inserts from real events.
+-- Readers needing exact counts before a merge must use FINAL (or an equivalent
+-- argMax / LIMIT 1 BY dedup) — see docs/SCHEMA.md "Delivery semantics".
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (cluster_id, api_group, kind, namespace, name, ts)
 ```
@@ -62,6 +72,32 @@ The sort key leads with the identity tuple and ends with `ts`, so all history
 for a single object is physically contiguous and time-ordered — the exact
 access pattern of both the warm-up query and typical audit lookups. Monthly
 partitioning keeps merges and TTL drops cheap at scale.
+
+### Delivery semantics
+
+The operator's write path is **at-least-once**, not exactly-once, at the row
+level. `driver.Batch.Send()` (and a single-row fallback `Exec`) is a network
+operation with three outcomes: nothing inserted; everything inserted but the
+acknowledgement lost (timeout or connection reset mid-response); or a partial
+insert. In the lost-ack and partial cases the call returns an error while the
+rows are already durable, so the writer's poison-isolation path re-inserts them.
+
+A re-inserted row is **byte-identical** to the original: `ts` is stamped once at
+reconcile time and frozen into the insert's positional args, so the re-insert
+carries the same `ts`, `sha256`, `uid`, `event_type`, `data`, and `diff`. Every
+column of the `ORDER BY` tuple is therefore identical, and `resource_states`
+(`ReplacingMergeTree`) **collapses the duplicate to a single row on merge**. The
+writer's per-job commit callback remains **exactly-once** regardless — a lost ack
+never causes a job to be counted or committed twice, only a physical row to be
+re-sent.
+
+Because `ReplacingMergeTree` de-duplicates only on background merge, a naive
+`SELECT *` can transiently observe a duplicate before the merge runs. **Any read
+that must not double-count must use `FINAL`** (or an explicit `argMax` / `LIMIT 1
+BY` dedup). The operator's own warm-up read (`statereader.go`) is already
+dedup-safe without `FINAL`: it `GROUP BY (namespace, name)` with `argMax(…, ts)`,
+so it emits exactly one row per identity regardless of unmerged duplicates, and
+argMax over byte-identical duplicates returns the same value either way.
 
 ### Deletion semantics — no sentinels
 
@@ -169,7 +205,7 @@ ALTER TABLE resource_states MODIFY TTL toDateTime(ts) + INTERVAL 1 YEAR;
 Or bake it into the table at creation time by appending to the DDL:
 
 ```sql
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (cluster_id, api_group, kind, namespace, name, ts)
 TTL toDateTime(ts) + INTERVAL 1 YEAR;

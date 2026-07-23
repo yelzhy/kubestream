@@ -128,10 +128,20 @@ type ReconcilerConfig struct {
 	// to ClickHouse (replaces the old hardcoded "local-kind-cluster").
 	ClusterID string
 	// MaxConcurrentReconciles bounds how many Reconciles run concurrently
-	// per watched GVK. Safe to raise above controller-runtime's default of
-	// 1 now that ClickHouse writes are off the Reconcile hot path (see
-	// sink.Writer) — but it's still a bound, not unlimited, so throughput
-	// can't grow without limit under event floods.
+	// per watched GVK. It MUST stay 1 under the current
+	// controller-runtime-driven architecture: raising it above 1 breaks
+	// Invariant 2 (per-key serialization). Moving ClickHouse writes off the
+	// hot path removed the latency reason for concurrency 1, but not the
+	// correctness reason — Reconcile performs a read-decide-write (Load the
+	// diff baseline → compute diff → Reserve → enqueue) that straddles the
+	// asynchronous commit boundary. Two concurrent same-key Reconciles can
+	// both Load the same committed baseline A and emit diff(A→B) and diff(A→C)
+	// against it; both rows land, so the recorded ClickHouse history is
+	// corrupted (the intermediate state B becomes unreachable by diff replay).
+	// The version gate keeps the in-memory cache correct (the newer Reserve
+	// wins) but cannot un-emit the already-enqueued rows. Genuine per-key
+	// concurrency is introduced only by the Phase 1 workqueue pipeline, whose
+	// per-key delivery contract owns that guarantee.
 	MaxConcurrentReconciles int
 	// WatchedGVKs is the set of resource types (including any CRD) this
 	// operator watches and streams to ClickHouse. cmd/main.go sources it
